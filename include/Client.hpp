@@ -56,18 +56,8 @@
 
 #include "Settings.hpp"
 #include "Timestamp.hpp"
-
-
-// Define fatal and nonfatal write errors
-#ifdef WIN32
-#define FATALTCPWRITERR(errno)  ((errno = WSAGetLastError()) != WSAETIMEDOUT)
-#define NONFATALTCPWRITERR(errno) ((errno = WSAGetLastError()) == WSAETIMEDOUT)
-#define FATALUDPWRITERR(errno)  (((errno = WSAGetLastError()) != WSAETIMEDOUT) && (errno != WSAECONNREFUSED))
-#else
-#define FATALTCPWRITERR(errno)  (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR)
-#define NONFATALTCPWRITERR(errno)  (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)
-#define FATALUDPWRITERR(errno) 	((errno != EAGAIN) && (errno != EWOULDBLOCK) && (errno != EINTR) && (errno != ECONNREFUSED) && (errno != ENOBUFS))
-#endif
+#include "isochronous.hpp"
+#include "Mutex.h"
 
 /* ------------------------------------------------------------------- */
 class Client {
@@ -85,39 +75,70 @@ public:
 
     // For things like dual tests a server needs to be started by the client,
     // The code in src/launch.cpp will invoke this
-    void InitiateServer();
+    int StartSynch(void);
+    void TxDelay(void);
+    void ConnectPeriodic(void);
+    bool my_connect(bool close_on_fail);
+    bool isConnected(void) const;
+    int SendFirstPayload(void);
+    int BarrierClient(struct BarrierMutex *);
+    struct ReportHeader *myJob;
 
 private:
-    void WritePacketID( intmax_t );
+    inline void WritePacketID(intmax_t);
+    inline void WriteTcpTxHdr(struct ReportStruct *, int, int);
+    inline double get_delay_target(void);
     void InitTrafficLoop(void);
+    void SetReportStartTime(void);
+    inline void SetFullDuplexReportStartTime(void);
     void FinishTrafficActions(void);
-    void FinalUDPHandshake(void);
-    void write_UDP_FIN(void);
+    void AwaitServerFinPacket(void);
     bool InProgress(void);
-
+    void PostNullEvent(void);
+    void AwaitServerCloseEvent(void);
+    bool connected;
+    ReportStruct scratchpad;
     ReportStruct *reportstruct;
     double delay_lower_bounds;
     intmax_t totLen;
-
+    bool one_report;
+    bool apply_first_udppkt_delay;
+    int udp_payload_minimum;
+    void myReportPacket (void);
+#ifdef HAVE_STRUCT_TCP_INFO_TCPI_TOTAL_RETRANS
+    struct tcp_info my_tcpi_stats;
+    bool myReportPacket (bool sample_tcpi);
+#endif
     // TCP plain
-    void RunTCP( void );
+    void RunTCP(void);
     // TCP version which supports rate limiting per -b
-    void RunRateLimitedTCP( void );
+    void RunRateLimitedTCP(void);
+    void RunNearCongestionTCP(void);
+#if HAVE_DECL_TCP_NOTSENT_LOWAT
+    bool AwaitWriteSelectEventTCP(void);
+    void RunWriteEventsTCP(void);
+#endif
     // UDP traffic with isochronous and vbr support
-    void RunUDPIsochronous( void );
+    void RunUDPIsochronous(void);
     // UDP plain
-    void RunUDP( void );
+    void RunUDP(void);
     // client connect
-    double Connect( );
-    void HdrXchange(int flags);
-
+    void PeerXchange(void);
     thread_Settings *mSettings;
-    char* mBuf;
+#if WIN32
+    SOCKET mySocket;
+#else
+    int mySocket;
+#endif
+    struct ReporterData *myReport;
     Timestamp mEndTime;
     Timestamp lastPacketTime;
     Timestamp now;
     char* readAt;
     Timestamp connect_done, connect_start;
+    Isochronous::FrameCounter *framecounter;
+    bool isburst;
+    bool peerclose;
 }; // end class Client
 
 #endif // CLIENT_H

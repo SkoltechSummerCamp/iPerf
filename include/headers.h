@@ -71,9 +71,6 @@
     #endif
 #endif /* HAVE_CONFIG_H */
 
-/* turn off assert debugging */
-#define NDEBUG
-
 /* standard C headers */
 #include <stdlib.h>
 #include <stdio.h>
@@ -86,6 +83,34 @@
 #include <sys/types.h>
 #include <fcntl.h>
 #include <inttypes.h>
+#include <limits.h>
+
+#ifdef HAVE_STDBOOL_H
+# include <stdbool.h>
+#else
+# ifndef HAVE__BOOL
+#  ifdef __cplusplus
+typedef bool _Bool;
+#  else
+#   define _Bool signed char
+#  endif
+# endif
+# define bool _Bool
+# define false 0
+# define true 1
+# define __bool_true_false_are_defined 1
+#endif
+
+
+#if ((defined HAVE_SSM_MULTICAST) || (defined HAVE_DECL_SO_BINDTODEVICE))  && (defined HAVE_NET_IF_H)
+#include <net/if.h>
+#endif
+
+#if ((HAVE_TUNTAP_TAP) || (HAVE_TUNTAP_TUN))
+#include <linux/if_tun.h>
+#include <sys/ioctl.h>
+#endif
+
 
 // AF_PACKET HEADERS
 #if defined(HAVE_LINUX_FILTER_H) && defined(HAVE_AF_PACKET)
