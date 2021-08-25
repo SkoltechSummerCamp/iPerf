@@ -1,4 +1,3 @@
-
 /*---------------------------------------------------------------
  * Copyright (c) 1999,2000,2001,2002,2003
  * The Board of Trustees of the University of Illinois
@@ -47,6 +46,8 @@
  *
  * List.h
  * by Kevin Gibbs <kgibbs@ncsa.uiuc.edu>
+ *
+ * renamed to active_hosts.h
  * -------------------------------------------------------------------
  */
 
@@ -55,14 +56,7 @@
 
 #include "headers.h"
 #include "Settings.hpp"
-#include "Reporter.h"
 #include "Mutex.h"
-
-/*
- * List handling utilities to replace STD vector
- */
-
-struct Iperf_ListEntry;
 
 /*
  * A List entry that consists of a sockaddr
@@ -71,26 +65,31 @@ struct Iperf_ListEntry;
  * entry
  */
 struct Iperf_ListEntry {
-    iperf_sockaddr data;
-    MultiHeader *holder;
-    thread_Settings *server;
-    Iperf_ListEntry *next;
+    iperf_sockaddr host;
+    struct SumReport *sum_report;
+    int thread_count;
+#if WIN32
+    SOCKET socket;
+#else
+    int socket;
+#endif
+    struct Iperf_ListEntry *next;
 };
 
-extern Mutex clients_mutex;
-extern Iperf_ListEntry *clients;
+struct Iperf_Table {
+    Mutex my_mutex;
+    struct Iperf_ListEntry *root;
+    int count;
+    int total_count;
+    int groupid;
+};
 
 /*
- * Functions to modify or search the List
+ * Functions to modify or search the list
  */
-void Iperf_pushback ( Iperf_ListEntry *add, Iperf_ListEntry **root );
-
-void Iperf_delete ( iperf_sockaddr *del, Iperf_ListEntry **root );
-
-void Iperf_destroy ( Iperf_ListEntry **root );
-
-Iperf_ListEntry* Iperf_present ( iperf_sockaddr *find, Iperf_ListEntry *root );
-
-Iperf_ListEntry* Iperf_hostpresent ( iperf_sockaddr *find, Iperf_ListEntry *root );
-
+void Iperf_initialize_active_table (void);
+void Iperf_destroy_active_table (void);
+int Iperf_push_host (struct thread_Settings *agent);
+int Iperf_push_host_port_conditional (struct thread_Settings *agent);
+void Iperf_remove_host (struct thread_Settings *agent);
 #endif
