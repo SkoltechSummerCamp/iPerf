@@ -49,6 +49,7 @@
 #define PACKETRINGC_H
 
 #include "Condition.h"
+#include "gettcpinfo.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -75,13 +76,11 @@ struct ReportStruct {
     intmax_t burstperiod;
     intmax_t remaining;
     int transit_ready;
-#ifdef HAVE_STRUCT_TCP_INFO_TCPI_TOTAL_RETRANS
-    int cwnd;
-    int rtt;
-    intmax_t retry_tot;
-    bool tcpistat_valid;
-#endif
-    double select_delay;
+    int writecnt;
+    long write_time;
+    struct timeval sentTimeRX;
+    struct timeval sentTimeTX;
+    struct iperf_tcpstats tcpstats;
 };
 
 struct PacketRing {

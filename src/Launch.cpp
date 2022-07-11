@@ -137,8 +137,12 @@ void listener_spawn(struct thread_Settings *thread) {
 void server_spawn(struct thread_Settings *thread) {
     Server *theServer = NULL;
 #ifdef HAVE_THREAD_DEBUG
-    thread_debug("spawn server settings=%p GroupSumReport=%p sock=%d", \
-		 (void *) thread, (void *)thread->mSumReport, thread->mSock);
+    if (isBounceBack(thread)) {
+	thread_debug("spawn server bounce-back");
+    } else {
+	thread_debug("spawn server settings=%p GroupSumReport=%p sock=%d", \
+		     (void *) thread, (void *)thread->mSumReport, thread->mSock);
+    }
 #endif
     // set traffic thread to realtime if needed
 #if HAVE_SCHED_SETSCHEDULER
@@ -153,7 +157,11 @@ void server_spawn(struct thread_Settings *thread) {
     if (isUDP(thread)) {
         theServer->RunUDP();
     } else {
-        theServer->RunTCP();
+	if (isBounceBack(thread)) {
+	    theServer->RunBounceBackTCP();
+	} else {
+	    theServer->RunTCP();
+	}
     }
     DELETE_PTR(theServer);
 }
@@ -163,7 +171,11 @@ static void clientside_client_basic (struct thread_Settings *thread, Client *the
     SockAddr_remoteAddr(thread);
     theClient->my_connect(true);
 #ifdef HAVE_THREAD_DEBUG
-    thread_debug("Client spawn thread basic (sock=%d)", thread->mSock);
+    if (isBounceBack(thread)) {
+	thread_debug("Launch: spawn client bounce-back mode, size = %d", thread->mBurstSize);
+    } else {
+	thread_debug("Launch: client spawn thread basic (sock=%d)", thread->mSock);
+    }
 #endif
     if ((thread->mThreads > 1) && !isNoConnectSync(thread) && !isCompat(thread))
 	// When -P > 1 then all threads finish connect before starting traffic
@@ -181,7 +193,7 @@ static void clientside_client_reverse (struct thread_Settings *thread, Client *t
     SockAddr_remoteAddr(thread);
     theClient->my_connect(true);
 #ifdef HAVE_THREAD_DEBUG
-    thread_debug("Client spawn thread reverse (sock=%d)", thread->mSock);
+    thread_debug("Launch: client spawn thread reverse (sock=%d)", thread->mSock);
 #endif
     if ((thread->mThreads > 1) && !isNoConnectSync(thread))
 	// When -P > 1 then all threads finish connect before starting traffic
@@ -219,7 +231,7 @@ static void clientside_client_fullduplex (struct thread_Settings *thread, Client
     setTransferID(reverse_client, 1);
     theClient->my_connect(true);
 #ifdef HAVE_THREAD_DEBUG
-    thread_debug("Client spawn thread fullduplex (sock=%d)", thread->mSock);
+    thread_debug("Launch: client spawn thread fullduplex (sock=%d)", thread->mSock);
 #endif
     if ((thread->mThreads > 1) && !isNoConnectSync(thread))
 	// When -P > 1 then all threads finish connect before starting traffic
@@ -243,7 +255,7 @@ static void clientside_client_fullduplex (struct thread_Settings *thread, Client
 
 static void serverside_client_fullduplex (struct thread_Settings *thread, Client *theClient) {
 #ifdef HAVE_THREAD_DEBUG
-    thread_debug("Listener spawn client thread (fd sock=%d)", thread->mSock);
+    thread_debug("Launch: Listener spawn client thread (fd sock=%d)", thread->mSock);
 #endif
     setTransferID(thread, 1);
     if (theClient->StartSynch() != -1) {
@@ -253,7 +265,7 @@ static void serverside_client_fullduplex (struct thread_Settings *thread, Client
 
 static void serverside_client_bidir (struct thread_Settings *thread, Client *theClient) {
 #ifdef HAVE_THREAD_DEBUG
-    thread_debug("Listener spawn client thread (bidir sock=%d)", thread->mSock);
+    thread_debug("Launch: Listener spawn client thread (bidir sock=%d)", thread->mSock);
 #endif
     setTransferID(thread, 1);
     SockAddr_zeroAddress(&thread->peer);
@@ -356,32 +368,41 @@ void client_init(struct thread_Settings *clients) {
     // For each of the needed threads create a copy of the
     // provided settings, unsetting the report flag and add
     // to the list of threads to start
-    for (int j = 0; j < (1 + clients->mPortLast - clients->mPort); j++) {
-	for (int i = 0; i < clients->mThreads; i++) {
-	    // skip first one as already set
-	    if (!(!j && !i)) {
-		Settings_Copy(clients, &next, 1);
-		// printf("*****port/thread = %d/%d\n", next->mPort + j, i);
-		if (next) {
-		    if (isIncrSrcIP(clients) && (clients->mLocalhost != NULL)) {
-			next->incrsrcip = i;
-		    }
-		    if (isIncrDstIP(clients)) {
-			next->incrdstip = i;
-			// force a setHostname
-			SockAddr_zeroAddress(&next->peer);
-		    } else if (clients->mBindPort) {
-			// case -B with src port and -P > 1
-			next->incrsrcport = i;
-		    }
-		    if (isIncrDstPort(clients)) {
-			next->mPort += j;
-			SockAddr_zeroAddress(&next->peer);
-		    }
-		}
-		itr->runNow = next;
-		itr = next;
+    for (int i = 1; i < clients->mThreads; i++) {
+	Settings_Copy(clients, &next, 1);
+	// printf("*****port/thread = %d/%d\n", next->mPort + i, i);
+	if (next) {
+	    if (isIncrSrcIP(clients) && (clients->mLocalhost != NULL)) {
+		next->incrsrcip = i;
 	    }
+	    if (isIncrDstIP(clients)) {
+		next->incrdstip = i;
+		// force a setHostname
+		SockAddr_zeroAddress(&next->peer);
+	    } else if (clients->mBindPort) {
+		// Increment the source port of none of the quintuple is being change or the user requests it
+		if ((!isIncrDstPort(clients) && !isIncrDstIP(clients) && !isIncrSrcIP(clients)) || isIncrSrcPort(clients)) {
+		    // case -B with src port and -P > 1
+		    next->incrsrcport = i;
+		}
+	    }
+	    if (isIncrDstPort(clients)) {
+		next->mPort += i;
+		SockAddr_zeroAddress(&next->peer);
+	    }
+	}
+	itr->runNow = next;
+	itr = next;
+    }
+    if (isBounceBack(clients) && isCongest(clients)) {
+	Settings_Copy(clients, &next, 1);
+	if (next != NULL) {
+	    setFullDuplex(next);
+	    unsetBounceBack(next);
+	    unsetEnhanced(next);
+	    next->mTOS = 0;
+	    itr->runNow = next;
+	    itr = next;
 	}
     }
 #else

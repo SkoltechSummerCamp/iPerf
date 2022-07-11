@@ -75,7 +75,7 @@ Client/Server:\n\
       --hide-ips           hide ip addresses and host names within outputs\n\
   -i, --interval  #        seconds between periodic bandwidth reports\n\
   -l, --len       #[kmKM]    length of buffer in bytes to read or write (Defaults: TCP=128K, v4 UDP=1470, v6 UDP=1450)\n\
-  -m, --print_mss          print TCP maximum segment size (MTU - TCP/IP header)\n\
+  -m, --print_mss          print TCP maximum segment size\n\
   -o, --output    <filename> output the report or error message to this specified file\n\
   -p, --port      #        client/server port to listen/send on and to connect\n\
       --permit-key         permit key to be used to verify client and server (TCP only)\n\
@@ -87,7 +87,7 @@ Client/Server:\n\
 #endif
 "  -B, --bind <host>[:<port>][%<dev>] bind to <host>, ip addr (including multicast address) and optional port and device\n\
   -C, --compatibility      for use with older versions does not sent extra msgs\n\
-  -M, --mss       #        set TCP maximum segment size (MTU - 40 bytes)\n\
+  -M, --mss       #        set TCP maximum segment size using TCP_MAXSEG\n\
   -N, --nodelay            set TCP no delay, disabling Nagle's Algorithm\n\
   -S, --tos       #        set the socket's IP_TOS (byte) field\n\
   -Z, --tcp-congestion <algo>  set TCP congestion control algorithm (Linux only)\n\
@@ -115,6 +115,11 @@ Server specific:\n\
 const char usage_long2[] = "\
 \n\
 Client specific:\n\
+      --bounceback         request a bounceback test (use -l for size, defaults to 100 bytes)\n\
+      --bounceback-congest request a concurrent full-duplex TCP stream\n\
+      --bounceback-hold    request the server to insert a delay of n milliseconds between its read and write\n\
+      --bounceback-period  request the client schedule a send every n milliseconds\n\
+      --bounceback-no-quickack request the server not set the TCP_QUICKACK socket option (disabling TCP ACK delays) during a bounceback test\n\
   -c, --client    <host>   run in client mode, connecting to <host>\n\
       --connect-only       run a connect only test\n\
       --connect-retries #  number of times to retry tcp connect\n\
@@ -126,13 +131,16 @@ Client specific:\n\
       --incr-dstip         Increment the destination ip with parallel (-P) traffic threads\n\
       --incr-dstport       Increment the destination port with parallel (-P) traffic threads\n\
       --incr-srcip         Increment the source ip with parallel (-P) traffic threads\n\
+      --incr-srcport       Increment the source port with parallel (-P) traffic threads\n\
       --local-only         Set don't route on socket\n\
       --near-congestion=[w] Use a weighted write delay per the sampled TCP RTT (experimental)\n\
       --no-connect-sync    No sychronization after connect when -P or parallel traffic threads\n\
       --no-udp-fin         No final server to client stats at end of UDP test\n\
   -n, --num       #[kmgKMG]    number of bytes to transmit (instead of -t)\n\
   -r, --tradeoff           Do a fullduplexectional test individually\n\
+      --tcp-quickack       set the socket's TCP_QUICKACK option (off by default)\n\
       --tcp-write-prefetch set the socket's TCP_NOTSENT_LOWAT value in bytes and use event based writes\n\
+      --tcp-write-times    measure the socket write times at the application level\n\
   -t, --time      #        time in seconds to transmit for (default 10 secs)\n\
       --trip-times         enable end to end measurements (requires client and server clock sync)\n\
       --txdelay-time       time in seconds to hold back after connect and before first write\n\
@@ -259,6 +267,12 @@ const char client_isochronous[] =
 const char client_burstperiod[] =
 "Bursting: %s every %0.2f seconds\n";
 
+const char client_bounceback[] =
+"Bounce-back test (size=%s) (server hold req=%d usecs & tcp_quickack)\n";
+
+const char client_bounceback_noqack[] =
+"Bounce-back test (size=%s) (server hold req=%d usecs)\n";
+
 const char server_burstperiod[] =
 "Burst wait timeout set to (2 * %0.2f) seconds (use --burst-period=<n secs> to change)\n";
 
@@ -341,15 +355,41 @@ const char report_sum_bw_read_enhanced_format[] =
 const char report_triptime_enhanced_format[] =
 "%s" IPERFTimeFrmt " trip-time (3WHS done->fin+finack) = %.4f sec\n";
 
-#ifdef HAVE_STRUCT_TCP_INFO_TCPI_TOTAL_RETRANS
+#if HAVE_TCP_STATS
+const char report_client_bb_bw_header[] =
+"[ ID] Interval" IPERFTimeSpace "Transfer    Bandwidth         BB cnt(cnt/s)=avg/min/max/stdev         Rtry  Cwnd/RTT\n";
+
+const char report_client_bb_bw_format[] =
+"%s" IPERFTimeFrmt " sec  %ss  %ss/sec    %d(%d)=%.3f/%.3f/%.3f/%.3f ms %4d %4dK/%u us\n";
+#else
+const char report_client_bb_bw_header[] =
+"[ ID] Interval" IPERFTimeSpace "Transfer    Bandwidth         BB cnt(cnt/s)=avg/min/max/stdev\n";
+
+const char report_client_bb_bw_format[] =
+"%s" IPERFTimeFrmt " sec  %ss  %ss/sec    %d(%d)=%.3f/%.3f/%.3f/%.3f ms\n";
+#endif
+const char report_client_bb_bw_triptime_format[] =
+"%s" IPERFTimeFrmt " sec  OWD Delays (ms) Cnt=%d(%d) To=%.3f/%.3f/%.3f/%.3f From=%.3f/%.3f/%.3f/%.3f Asymmetry=%.3f/%.3f/%.3f/%.3f\n";
+
+const char report_write_enhanced_write_header[] =
+"[ ID] Interval" IPERFTimeSpace "Transfer    Bandwidth       Write/Err  Rtry     Cwnd/RTT        NetPwr  write-times avg/min/max/stdev (cnt)\n";
+
+const char report_write_enhanced_write_format[] =
+"%s" IPERFTimeFrmt " sec  %ss  %ss/sec  %d/%d %10d %8dK/%u us  %s  %.3f/%.3f/%.3f/%.3f ms (%d)\n";
+
+const char report_write_enhanced_nocwnd_write_format[] =
+"%s" IPERFTimeFrmt " sec  %ss  %ss/sec  %d/%d %10d       NA/%u us  %s  %.3f/%.3f/%.3f/%.3f ms (%d)\n";
+
+
+#if HAVE_TCP_STATS
 const char report_bw_write_enhanced_header[] =
-"[ ID] Interval" IPERFTimeSpace "Transfer    Bandwidth       Write/Err  Rtry     Cwnd/RTT        NetPwr\n";
+"[ ID] Interval" IPERFTimeSpace "Transfer    Bandwidth       Write/Err  Rtry     Cwnd/RTT(var)        NetPwr\n";
 
 const char report_sum_bw_write_enhanced_format[] =
 "[SUM] " IPERFTimeFrmt " sec  %ss  %ss/sec  %d/%d%10d\n";
 
 const char report_bw_write_enhanced_format[] =
-"%s" IPERFTimeFrmt " sec  %ss  %ss/sec  %d/%d %10d %8dK/%u us  %s\n";
+"%s" IPERFTimeFrmt " sec  %ss  %ss/sec  %d/%d %10d %8dK/%u(%u) us  %s\n";
 
 const char report_bw_write_enhanced_nocwnd_format[] =
 "%s" IPERFTimeFrmt " sec  %ss  %ss/sec  %d/%d %10d       NA/%u us  %s\n";
@@ -364,6 +404,7 @@ const char report_write_enhanced_isoch_nocwnd_format[] =
 "%s" IPERFTimeFrmt " sec  %ss  %ss/sec  %d/%d %10d    NA/%u us  %9" PRIuMAX "/%" PRIuMAX "/%" PRIuMAX " %s\n";
 
 #else
+
 const char report_bw_write_enhanced_header[] =
 "[ ID] Interval" IPERFTimeSpace "Transfer    Bandwidth       Write/Err\n";
 
@@ -378,7 +419,6 @@ const char report_write_enhanced_isoch_header[] =
 
 const char report_write_enhanced_isoch_format[] =
 "%s" IPERFTimeFrmt " sec  %ss  %ss/sec  %d/%d %9" PRIuMAX "/%" PRIuMAX "/%" PRIuMAX "\n";
-
 #endif
 
 const char report_sumcnt_bw_write_enhanced_header[] =
@@ -473,6 +513,26 @@ const char report_burst_read_tcp_format[] =
 "%s" IPERFTimeFrmt " sec  %ss  %ss/sec  %6.3f ms (%.2g%%)    %d=%d:%d:%d:%d:%d:%d:%d:%d  %s\n";
 
 const char report_burst_read_tcp_final_format[] =
+"%s" IPERFTimeFrmt " sec  %ss  %ss/sec  %.3f/%.3f/%.3f/%.3f ms  %d=%d:%d:%d:%d:%d:%d:%d:%d\n";
+#if HAVE_TCP_STATS
+const char report_burst_write_tcp_header[] =
+"[ ID] Burst (start-end)" IPERFFTimeSpace "Transfer     Bandwidth       XferTime  Write/Err  Rtry  Cwnd/RTT   NetPwr\n";
+
+const char report_burst_write_tcp_format[] =
+"%s" IPERFTimeFrmt " sec  %ss  %ss/sec  %6.3f ms %d/%d %10d %8dK/%u %s\n";
+
+#else
+const char report_burst_write_tcp_header[] =
+"[ ID] Burst (start-end)" IPERFFTimeSpace "Transfer     Bandwidth       XferTime  Write/Err\n";
+
+const char report_burst_write_tcp_format[] =
+"%s" IPERFTimeFrmt " sec  %ss  %ss/sec  %6.3f ms %d/%d\n";
+#endif
+
+const char report_burst_write_tcp_nocwnd_format[] =
+"%s" IPERFTimeFrmt " sec  %ss  %ss/sec  %6.3f ms %d/%d %10d NA/%u %s\n";
+
+const char report_burst_write_tcp_final_format[] =
 "%s" IPERFTimeFrmt " sec  %ss  %ss/sec               %d=%d:%d:%d:%d:%d:%d:%d:%d\n";
 
 /* -------------------------------------------------------------------
@@ -529,8 +589,11 @@ const char report_peer_fail [] =
 const char report_mss_unsupported[] =
 "%sMSS and MTU size unknown (TCP_MAXSEG not supported)\n";
 
+const char report_default_mss[] =
+"MSS size %d bytes\n";
+
 const char report_mss[] =
-"%sMSS size %d bytes\n";
+"MSS req size %d bytes (per TCP_MAXSEG)\n";
 
 const char report_datagrams[] =
 "[%3d] Sent %d datagrams\n";

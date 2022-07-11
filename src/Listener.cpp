@@ -283,7 +283,7 @@ void Listener::Run () {
 	// This is required for accurate traffic statistics
 	if (!isCompat(server) && (isConnectOnly(server) || !apply_client_settings(server))) {
 	    if (isConnectionReport(server) && !isSumOnly(server)) {
-		struct ReportHeader *reporthdr = InitConnectionReport(server, 0);
+		struct ReportHeader *reporthdr = InitConnectionReport(server);
 		struct ConnectionInfo *cr = static_cast<struct ConnectionInfo *>(reporthdr->this_report);
 		cr->connect_timestamp.tv_sec = server->accept_time.tv_sec;
 		cr->connect_timestamp.tv_usec = server->accept_time.tv_usec;
@@ -317,6 +317,7 @@ void Listener::Run () {
 	if (isUDP(server) && isCompat(mSettings)) {
 	    setSeqNo64b(server);
 	}
+	setTransferID(server, 0);
 
 	// Read any more test settings and test values (not just the flags) and instantiate
 	// any settings objects for client threads (e.g. bidir or full duplex)
@@ -371,7 +372,7 @@ void Listener::Run () {
 	}
 	setTransferID(server, 0);
 	if (isConnectionReport(server) && !isSumOnly(server)) {
-	    struct ReportHeader *reporthdr = InitConnectionReport(server, 0);
+	    struct ReportHeader *reporthdr = InitConnectionReport(server);
 	    struct ConnectionInfo *cr = static_cast<struct ConnectionInfo *>(reporthdr->this_report);
 	    cr->connect_timestamp.tv_sec = server->accept_time.tv_sec;
 	    cr->connect_timestamp.tv_usec = server->accept_time.tv_usec;
@@ -416,7 +417,7 @@ void Listener::my_listen () {
 	// will be created to supercede this one
 	type = (isUDP(mSettings)  ?  SOCK_DGRAM  :  SOCK_STREAM);
 	domain = (SockAddr_isIPv6(&mSettings->local) ?
-#ifdef HAVE_IPV6
+#if HAVE_IPV6
 		  AF_INET6
 #else
 		  AF_INET
@@ -541,7 +542,7 @@ void Listener::my_multicast_join () {
 	    WARN_errno(rc == SOCKET_ERROR, "ip_multicast_all");
 #endif
 	} else {
-#if (HAVE_IPV6_MULTICAST && (HAVE_DECL_IPV6_JOIN_GROUP || HAVE_DECL_IPV6_ADD_MEMBERSHIP))
+#if (HAVE_IPV6 && HAVE_IPV6_MULTICAST && (HAVE_DECL_IPV6_JOIN_GROUP || HAVE_DECL_IPV6_ADD_MEMBERSHIP))
 	    struct ipv6_mreq mreq;
 	    memcpy(&mreq.ipv6mr_multiaddr, SockAddr_get_in6_addr(&mSettings->local), sizeof(mreq.ipv6mr_multiaddr));
 	    mreq.ipv6mr_interface = 0;
@@ -575,7 +576,7 @@ void Listener::my_multicast_join () {
 #endif
 
         if (isIPV6(mSettings)) {
-#ifdef HAVE_IPV6_MULTICAST
+#if HAVE_IPV6_MULTICAST
 	    if (mSettings->mSSMMulticastStr) {
 		struct group_source_req group_source_req;
 		struct sockaddr_in6 *group;
@@ -805,7 +806,7 @@ bool Listener::L2_setup (thread_Settings *server, int sockfd) {
     // Now optimize packet flow up the raw socket
     // Establish the flow BPF to forward up only "connected" packets to this raw socket
     if (l->sa_family == AF_INET6) {
-#ifdef HAVE_IPV6
+#if HAVE_IPV6
 	struct in6_addr *v6peer = SockAddr_get_in6_addr(&server->peer);
 	struct in6_addr *v6local = SockAddr_get_in6_addr(&server->local);
 	if (isIPV6(server)) {
@@ -858,7 +859,7 @@ bool Listener::tap_setup (thread_Settings *server, int sockfd) {
     // Now optimize packet flow up the raw socket
     // Establish the flow BPF to forward up only "connected" packets to this raw socket
     if (l->sa_family == AF_INET6) {
-#ifdef HAVE_IPV6
+#if HAVE_IPV6
 	struct in6_addr *v6peer = SockAddr_get_in6_addr(&server->peer);
 	struct in6_addr *v6local = SockAddr_get_in6_addr(&server->local);
 	if (isIPV6(server)) {
@@ -896,7 +897,11 @@ int Listener::udp_accept (thread_Settings *server) {
     // The INVALID socket is used to keep the while loop going
     server->mSock = INVALID_SOCKET;
     nread = recvfrom(ListenSocket, server->mBuf, server->mBufLen, 0, \
-		  reinterpret_cast<struct sockaddr*>(&server->peer), &server->size_peer);
+		     reinterpret_cast<struct sockaddr*>(&server->peer), &server->size_peer);
+    Timestamp now;
+    server->accept_time.tv_sec = now.getSecs();
+    server->accept_time.tv_usec = now.getUsecs();
+
 #if HAVE_THREAD_DEBUG
     {
 	char tmpaddr[200];
@@ -997,16 +1002,14 @@ int Listener::my_accept (thread_Settings *server) {
 	// accept a TCP  connection
 	server->mSock = accept(ListenSocket, reinterpret_cast<sockaddr*>(&server->peer), &server->size_peer);
 	if (server->mSock > 0) {
+	    Timestamp now;
+	    server->accept_time.tv_sec = now.getSecs();
+	    server->accept_time.tv_usec = now.getUsecs();
 	    server->size_local = sizeof(iperf_sockaddr);
 	    getsockname(server->mSock, reinterpret_cast<sockaddr*>(&server->local), &server->size_local);
 	    SockAddr_Ifrname(server);
 	    Iperf_push_host(server);
 	}
-    }
-    if (server->mSock > 0) {
-	Timestamp now;
-	server->accept_time.tv_sec = now.getSecs();
-	server->accept_time.tv_usec = now.getUsecs();
     }
     return server->mSock;
 } // end my_accept
@@ -1033,6 +1036,11 @@ bool Listener::apply_client_settings (thread_Settings *server) {
     } else if (!isConnectOnly(server)) {
 	rc = apply_client_settings_tcp(server);
     }
+    if (isOverrideTOS(server)) {
+	SetSocketOptionsIPTos(server, server->mRTOS);
+    } else if (server->mTOS) {
+	SetSocketOptionsIPTos(server, server->mTOS);
+    }
     return rc;
 }
 
@@ -1055,7 +1063,7 @@ inline bool Listener::test_permit_key(uint32_t flags, thread_Settings *server, i
     }
     if (!isUDP(server)) {
 	int nread = 0;
-	nread = recvn(server->mSock, server->mBuf, keyoffset + keylen, 0);
+	nread = recvn(server->mSock, reinterpret_cast<char *>(&thiskey->value), keylen, 0);
 	FAIL_errno((nread < (keyoffset + keylen)), "read key", server);
     }
     strncpy(server->mPermitKey, thiskey->value, MAX_PERMITKEY_LEN + 1);
@@ -1088,7 +1096,13 @@ bool Listener::apply_client_settings_udp (thread_Settings *server) {
 	if (seqno != 1) {
 	    fprintf(stderr, "WARN: first received packet (id=%d) was not first sent packet, report start time will be off\n", seqno);
 	}
-	setTripTime(server);
+	Timestamp now;
+	if (!isTxStartTime(server) && ((abs(now.getSecs() - server->sent_time.tv_sec)) > (MAXDIFFTIMESTAMPSECS + 1))) {
+	    fprintf(stdout,"WARN: ignore --trip-times because client didn't provide valid start timestamp within %d seconds of now\n", MAXDIFFTIMESTAMPSECS);
+	    unsetTripTime(server);
+	} else {
+	    setTripTime(server);
+	}
 	setEnhanced(server);
     } else if ((flags & HEADER_VERSION1) || (flags & HEADER_VERSION2) || (flags & HEADER_EXTEND)) {
 	if ((flags & HEADER_VERSION1) && !(flags & HEADER_VERSION2)) {
@@ -1136,6 +1150,7 @@ bool Listener::apply_client_settings_udp (thread_Settings *server) {
 		Timestamp now;
 		if (!isTxStartTime(server) && ((abs(now.getSecs() - server->sent_time.tv_sec)) > (MAXDIFFTIMESTAMPSECS + 1))) {
 		    fprintf(stdout,"WARN: ignore --trip-times because client didn't provide valid start timestamp within %d seconds of now\n", MAXDIFFTIMESTAMPSECS);
+		    unsetTripTime(server);
 		} else {
 		    setTripTime(server);
 		    setEnhanced(server);
@@ -1160,6 +1175,11 @@ bool Listener::apply_client_settings_udp (thread_Settings *server) {
 }
 bool Listener::apply_client_settings_tcp (thread_Settings *server) {
     bool rc = false;
+#if HAVE_TCP_STATS
+    if (!isUDP(mSettings)) {
+        gettcpinfo(server->mSock, &server->tcpinitstats);
+    }
+#endif
     int nread = recvn(server->mSock, server->mBuf, sizeof(uint32_t), 0);
     char *readptr = server->mBuf;
     if (nread == 0) {
@@ -1175,92 +1195,145 @@ bool Listener::apply_client_settings_tcp (thread_Settings *server) {
 	readptr += nread;
 	struct client_tcp_testhdr *hdr = reinterpret_cast<struct client_tcp_testhdr *>(server->mBuf);
 	uint32_t flags = ntohl(hdr->base.flags);
-	uint16_t upperflags = 0;
-	int readlen;
-	// figure out the length of the test header
-	if ((readlen = Settings_ClientTestHdrLen(flags, server)) > 0) {
-	    // read the test settings passed to the server by the client
-	    nread += recvn(server->mSock, readptr, (readlen - (int) sizeof(uint32_t)), 0);
-	    FAIL_errno((nread < readlen), "read tcp test info", server);
-	    if (isPermitKey(mSettings)) {
-		if (!test_permit_key(flags, server, readlen)) {
+	if (flags & HEADER_BOUNCEBACK) {
+	    struct bounceback_hdr *bbhdr = reinterpret_cast<struct bounceback_hdr *>(server->mBuf);
+	    setBounceBack(server);
+	    nread = recvn(server->mSock, readptr, sizeof(struct bounceback_hdr), 0);
+	    if (nread != sizeof(struct bounceback_hdr)) {
+		WARN(1, "read bounce back header failed");
+		rc = false;
+		goto DONE;
+	    }
+	    readptr += nread;
+	    server->mBounceBackBytes = ntohl(bbhdr->bbsize);
+	    server->mBounceBackHold = ntohl(bbhdr->bbhold);
+	    uint16_t bbflags = ntohs(bbhdr->bbflags);
+	    if (bbflags & HEADER_BBCLOCKSYNCED) {
+		setTripTime(server);
+		server->sent_time.tv_sec = ntohl(bbhdr->bbclientTx_ts.sec);
+		server->sent_time.tv_usec = ntohl(bbhdr->bbclientTx_ts.usec);
+	    }
+	    if (bbflags & HEADER_BBTOS) {
+		server->mTOS = ntohs(bbhdr->tos);
+	    }
+#if HAVE_DECL_TCP_QUICKACK
+	    if (bbflags & HEADER_BBQUICKACK) {
+		setTcpQuickAck(server);
+	    }
+#endif
+	    int remaining =  server->mBounceBackBytes - (sizeof(struct bounceback_hdr) + sizeof(uint32_t));
+	    if (remaining < 0) {
+		WARN(1, "bounce back bytes too small");
+		rc = false;
+		goto DONE;
+	    } else if (remaining > 0) {
+		nread = recvn(server->mSock, readptr, remaining, 0);
+		if (nread != remaining) {
+		    WARN(1, "read bounce back payload failed");
 		    rc = false;
 		    goto DONE;
 		}
-	    } else if (flags & HEADER_KEYCHECK) {
-		rc = false;
-		server->mKeyCheck = false;
-		goto DONE;
 	    }
-	    server->firstreadbytes = nread;
-	    struct client_tcp_testhdr *hdr = reinterpret_cast<struct client_tcp_testhdr*>(server->mBuf);
-	    if ((flags & HEADER_VERSION1) && !(flags & HEADER_VERSION2)) {
-		if (flags & RUN_NOW)
-		    server->mMode = kTest_DualTest;
-		else
-		    server->mMode = kTest_TradeOff;
-	    }
-	    if (flags & HEADER_EXTEND) {
-		upperflags = htons(hdr->extend.upperflags);
-		server->mTOS = ntohs(hdr->extend.tos);
-		server->peer_version_u = ntohl(hdr->extend.version_u);
-		server->peer_version_l = ntohl(hdr->extend.version_l);
-		if (upperflags & HEADER_ISOCH) {
-		    setIsochronous(server);
-		}
-		if (upperflags & HEADER_EPOCH_START) {
-		    server->txstart_epoch.tv_sec = ntohl(hdr->start_fq.start_tv_sec);
-		    server->txstart_epoch.tv_usec = ntohl(hdr->start_fq.start_tv_usec);
-		    Timestamp now;
-		    if ((abs(now.getSecs() - server->txstart_epoch.tv_sec)) > (MAXDIFFTXSTART + 1)) {
-			fprintf(stdout,"WARN: ignore --txstart-time because client didn't provide valid start timestamp within %d seconds of now\n", MAXDIFFTXSTART);
-			unsetTxStartTime(server);
-		    } else {
-			setTxStartTime(server);
+	    Timestamp now;
+	    bbhdr->bbserverRx_ts.sec = htonl(now.getSecs());
+	    bbhdr->bbserverRx_ts.usec = htonl(now.getUsecs());
+	} else {
+	    uint16_t upperflags = 0;
+	    int readlen;
+	    // figure out the length of the test header
+	    if ((readlen = Settings_ClientTestHdrLen(flags, server)) > 0) {
+		// read the test settings passed to the server by the client
+		nread += recvn(server->mSock, readptr, (readlen - (int) sizeof(uint32_t)), 0);
+		FAIL_errno((nread < readlen), "read tcp test info", server);
+		if (isPermitKey(mSettings)) {
+		    if (!test_permit_key(flags, server, readlen)) {
+			rc = false;
+			goto DONE;
 		    }
+		} else if (flags & HEADER_KEYCHECK) {
+		    rc = false;
+		    server->mKeyCheck = false;
+		    goto DONE;
 		}
-		if (upperflags & HEADER_TRIPTIME) {
-		    Timestamp now;
-		    server->sent_time.tv_sec = ntohl(hdr->start_fq.start_tv_sec);
-		    server->sent_time.tv_usec = ntohl(hdr->start_fq.start_tv_usec);
-		    if (!isTxStartTime(server) && ((abs(now.getSecs() - server->sent_time.tv_sec)) > (MAXDIFFTIMESTAMPSECS + 1))) {
-			fprintf(stdout,"WARN: ignore --trip-times because client didn't provide valid start timestamp within %d seconds of now\n", MAXDIFFTIMESTAMPSECS);
-		    } else {
-			setTripTime(server);
+		server->firstreadbytes = nread;
+		struct client_tcp_testhdr *hdr = reinterpret_cast<struct client_tcp_testhdr*>(server->mBuf);
+		if ((flags & HEADER_VERSION1) && !(flags & HEADER_VERSION2)) {
+		    if (flags & RUN_NOW)
+			server->mMode = kTest_DualTest;
+		    else
+			server->mMode = kTest_TradeOff;
+		}
+		if (flags & HEADER_EXTEND) {
+		    upperflags = htons(hdr->extend.upperflags);
+		    server->mTOS = ntohs(hdr->extend.tos);
+		    server->peer_version_u = ntohl(hdr->extend.version_u);
+		    server->peer_version_l = ntohl(hdr->extend.version_l);
+		    if (upperflags & HEADER_ISOCH) {
+			setIsochronous(server);
+		    }
+		    if (upperflags & HEADER_EPOCH_START) {
+			server->txstart_epoch.tv_sec = ntohl(hdr->start_fq.start_tv_sec);
+			server->txstart_epoch.tv_usec = ntohl(hdr->start_fq.start_tv_usec);
+			Timestamp now;
+			if ((abs(now.getSecs() - server->txstart_epoch.tv_sec)) > (MAXDIFFTXSTART + 1)) {
+			    fprintf(stdout,"WARN: ignore --txstart-time because client didn't provide valid start timestamp within %d seconds of now\n", MAXDIFFTXSTART);
+			    unsetTxStartTime(server);
+			} else {
+			    setTxStartTime(server);
+			}
+		    }
+		    if (upperflags & HEADER_TRIPTIME) {
+			Timestamp now;
+			server->sent_time.tv_sec = ntohl(hdr->start_fq.start_tv_sec);
+			server->sent_time.tv_usec = ntohl(hdr->start_fq.start_tv_usec);
+			if (!isTxStartTime(server) && ((abs(now.getSecs() - server->sent_time.tv_sec)) > (MAXDIFFTIMESTAMPSECS + 1))) {
+			    fprintf(stdout,"WARN: ignore --trip-times because client didn't provide valid start timestamp within %d seconds of now\n", MAXDIFFTIMESTAMPSECS);
+			    unsetTripTime(server);
+			} else {
+			    setTripTime(server);
+			    setEnhanced(server);
+			}
+		    }
+		    if (upperflags & HEADER_PERIODICBURST) {
 			setEnhanced(server);
+			setFrameInterval(server);
+			setPeriodicBurst(server);
+			{
+			    struct client_tcp_testhdr *hdr = reinterpret_cast<struct client_tcp_testhdr *>(server->mBuf);
+			    server->mFPS = ntohl(hdr->isoch_settings.FPSl);
+			    server->mFPS += ntohl(hdr->isoch_settings.FPSu) / static_cast<double>(rMillion);
+			}
+			if (!server->mFPS) {
+			    server->mFPS = 1.0;
+			}
 		    }
-		}
-		if (upperflags & HEADER_PERIODICBURST) {
-		    setEnhanced(server);
-		    setFrameInterval(server);
-		    setPeriodicBurst(server);
-		    {
-			struct client_tcp_testhdr *hdr = reinterpret_cast<struct client_tcp_testhdr *>(server->mBuf);
-			server->mFPS = ntohl(hdr->isoch_settings.FPSl);
-			server->mFPS += ntohl(hdr->isoch_settings.FPSu) / static_cast<double>(rMillion);
+		    if (flags & HEADER_VERSION2) {
+			if (upperflags & HEADER_FULLDUPLEX) {
+			    setFullDuplex(server);
+			    setServerReverse(server);
+			}
+			if (upperflags & HEADER_REVERSE) {
+			    server->mThreadMode=kMode_Client;
+			    setServerReverse(server);
+			}
 		    }
-		    if (!server->mFPS) {
-			server->mFPS = 1.0;
-		    }
-		}
-		if (flags & HEADER_VERSION2) {
-		    if (upperflags & HEADER_FULLDUPLEX) {
-			setFullDuplex(server);
-			setServerReverse(server);
-		    }
-		    if (upperflags & HEADER_REVERSE) {
-			server->mThreadMode=kMode_Client;
-			setServerReverse(server);
-		    }
-		}
 #if HAVE_DECL_TCP_NOTSENT_LOWAT
-		if ((isServerReverse(server) || isFullDuplex(server)) && (upperflags & HEADER_WRITEPREFETCH)) {
-		    server->mWritePrefetch = ntohl(hdr->extend.TCPWritePrefetch);
-		    if (server->mWritePrefetch > 0) {
-			setWritePrefetch(server);
+		    if ((isServerReverse(server) || isFullDuplex(server)) && (upperflags & HEADER_WRITEPREFETCH)) {
+			server->mWritePrefetch = ntohl(hdr->extend.TCPWritePrefetch);
+			if (server->mWritePrefetch > 0) {
+			    setWritePrefetch(server);
+			}
+		    }
+#endif
+#if HAVE_DECL_TCP_QUICKACK
+		    if (upperflags & HEADER_TCPQUICKACK) {
+			setTcpQuickAck(server);
+		    }
+#endif
+		    if (upperflags & HEADER_BOUNCEBACK) {
+			setBounceBack(server);
 		    }
 		}
-#endif
 	    }
 	}
 	// Handle case that requires an ack back to the client

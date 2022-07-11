@@ -5,7 +5,7 @@ dnl ===================================================================
 
 
 AC_PREREQ(2.59)
-AC_INIT(Iperf,2.1.4)
+AC_INIT(Iperf,2.1.7)
 AC_CONFIG_HEADER([config.h])
 AM_INIT_AUTOMAKE()
 
@@ -18,11 +18,15 @@ m4_include([m4/ax_pthread.m4])
 
 AC_ARG_ENABLE(ipv6, AC_HELP_STRING([--disable-ipv6],
 	    [disable ipv6 support (default is autodetect)]),
-	ac_cv_have_ipv6=$enable_ipv6,)
+	ac_cv_have_ipv6=$enable_ipv6)
 
 AC_ARG_ENABLE(multicast, AC_HELP_STRING([--disable-multicast],
 	    [disable multicast support (default is autodetect)]),
-	ac_cv_multicast=$enable_multicast,)
+	ac_cv_multicast=$enable_multicast)
+
+AC_ARG_ENABLE(tcpstats, AC_HELP_STRING([--disable-tcpstats],
+	    [disable tcpstats support (default is autodetect)]),
+	ac_cv_tcpstats=$enable_tcpstats)
 
 AC_ARG_ENABLE(threads, AC_HELP_STRING([--disable-threads],
 	    [disable thread support (default is autodetect)]))
@@ -50,6 +54,10 @@ AC_ARG_ENABLE(seqno64b, AC_HELP_STRING([--disable-seqno64b],
 AC_ARG_ENABLE(fastsampling, AC_HELP_STRING([--enable-fastsampling],
 	    [enable support for 100 microsecond report intervals (default is disable)]))
 AM_CONDITIONAL([FASTSAMPLING], [test "x$enable_fastsampling" = "xyes"])
+
+AC_ARG_ENABLE(discover_defaultlen, AC_HELP_STRING([--enable-discover-defaultlen],
+	    [enable support to set the default payload size after device MTU discovery  (default is disable)]))
+AM_CONDITIONAL([DISCOVER_DEFAULTLEN], [test "x$enable_discover_defaultlen" = "xyes"])
 
 AC_ARG_ENABLE(thread_debug, AC_HELP_STRING([--enable-thread-debug],
 	    [enable support for thread debugging (default is disable)]))
@@ -94,7 +102,7 @@ AS_IF([test "x$enable_af_packet" = "xyes"], [
       AC_DEFINE([HAVE_AF_PACKET],[1],[AF_PACKET support is available]),
       [enable_af_packet="no"],
       [[#include <sys/socket.h>
-      #include <linux/if_packet.h>]]),
+      #include <linux/if_packet.h>]])
    AM_CONDITIONAL([AF_PACKET], [test "x${enable_af_packet}" = "xyes"])
 ])
 
@@ -167,7 +175,7 @@ AC_SEARCH_LIBS([socket], [socket], [],
 
 dnl Checks for header files.
 AC_HEADER_STDC
-AC_CHECK_HEADERS([arpa/inet.h libintl.h net/ethernet.h net/if.h linux/ip.h linux/udp.h linux/if_packet.h linux/filter.h linux/if_tun.h netdb.h netinet/in.h netinet/tcp.h stdlib.h string.h strings.h sys/socket.h sys/time.h syslog.h unistd.h signal.h ifaddrs.h])
+AC_CHECK_HEADERS([arpa/inet.h libintl.h net/ethernet.h net/if.h sys/ioctl.h sys/sockio.h linux/sockios.h linux/ip.h linux/udp.h linux/if_packet.h linux/filter.h linux/if_tun.h netdb.h netinet/in.h netinet/tcp.h stdlib.h string.h strings.h sys/socket.h sys/time.h syslog.h unistd.h signal.h ifaddrs.h])
 
 dnl ===================================================================
 dnl Checks for typedefs, structures
@@ -213,6 +221,14 @@ AC_FUNC_VPRINTF
 AC_CHECK_FUNCS([atexit memset select strchr strerror strtol strtoll usleep clock_gettime sched_setscheduler sched_yield mlockall setitimer nanosleep clock_nanosleep freopen])
 AC_REPLACE_FUNCS(snprintf inet_pton inet_ntop gettimeofday)
 AC_CHECK_DECLS([ENOBUFS, EWOULDBLOCK],[],[],[#include <errno.h>])
+AC_CHECK_DECLS([SIOCGIFMTU],[],[],[
+#ifdef HAVE_LINUX_SOCKIOS_H
+#include <linux/sockios.h>
+#endif
+#ifdef HAVE_SYS_SOCKIO_H
+#include <sys/sockio.h>
+#endif
+])
 AC_CHECK_DECLS([pthread_cancel],[],[],[#include <pthread.h>])
 AC_CHECK_DECLS([CPU_SET],[],[],[
 	#define _GNU_SOURCE
@@ -236,10 +252,12 @@ in_h='
 '
 
 AC_CHECK_DECLS([AF_INET6, SO_TIMESTAMP, SO_SNDTIMEO, SO_REUSEPORT, SO_BINDTODEVICE, MSG_DONTWAIT,
-			  SO_MAX_PACING_RATE, SO_DONTROUTE, IPV6_TCLASS, IP_MULTICAST_ALL,
-			  MCAST_JOIN_GROUP, MCAST_JOIN_SOURCE_GROUP, IPV6_JOIN_GROUP, TCP_NODELAY,
-			  IPV6_ADD_MEMBERSHIP, IPV6_MULTICAST_HOPS, MSG_PEEK, MSG_WAITALL, TCP_WINDOW_CLAMP,
-			  TCP_NOTSENT_LOWAT, IP_ADD_MEMBERSHIP, IP_ADD_SOURCE_MEMBERSHIP],[],[],[$in_h])
+			  SO_MAX_PACING_RATE, SO_DONTROUTE, IPV6_TCLASS, IP_MULTICAST_ALL, IP_TOS,
+			  MCAST_JOIN_GROUP, MCAST_JOIN_SOURCE_GROUP, IPV6_JOIN_GROUP, IPV6_V6ONLY,
+			  IPV6_ADD_MEMBERSHIP, IPV6_MULTICAST_HOPS, MSG_PEEK, MSG_WAITALL,
+			  TCP_NODELAY, TCP_INFO, TCP_CONNECTION_INFO, TCP_WINDOW_CLAMP, TCP_QUICKACK,
+			  TCP_NOTSENT_LOWAT, TCP_MAXSEG, IP_ADD_MEMBERSHIP, IP_ADD_SOURCE_MEMBERSHIP],
+			  [],[],[$in_h])
 
 AC_CHECK_TYPES([struct sockaddr_storage, struct sockaddr_in6,
 		       struct group_source_req, struct ip_mreq,
@@ -247,6 +265,11 @@ AC_CHECK_TYPES([struct sockaddr_storage, struct sockaddr_in6,
 
 AC_CHECK_MEMBERS([struct sockaddr_in6.sin6_len,
 			 struct ip_mreq_source.imr_multiaddr.s_addr], [], [],[$in_h])
+
+AC_CHECK_MEMBER([struct tcp_info.tcpi_total_retrans], [], [],[
+#include <netinet/in.h>
+#include <netinet/tcp.h>
+])
 
 AC_CHECK_MEMBERS([struct tcp_info.tcpi_total_retrans], [], [],[
 #include <netinet/in.h>
@@ -294,6 +317,25 @@ if test "$ac_cv_multicast" != no; then
   AC_MSG_RESULT($ac_cv_ssm_multicast)
   if test "$ac_cv_ssm_multicast" = yes; then
     AC_DEFINE([HAVE_SSM_MULTICAST], 1, [Define to enable ssm multicast support])
+  fi
+fi
+
+dnl check for tcpstats
+if test "$ac_cv_tcpstats" != no; then
+  AC_MSG_CHECKING(for tcpstats support)
+  ac_cv_tcpstats=no
+  if test "$ac_cv_have_decl_TCP_INFO" = yes; then
+    AC_MSG_CHECKING(for TCP_INFO_TCPI_TOTAL_RETRANS support)
+     if test "$ac_cv_member_struct_tcp_info_tcpi_total_retrans" = yes; then
+       ac_cv_tcpstats=yes
+     fi
+  fi
+  if test "$ac_cv_have_decl_TCP_CONNECTION_INFO" = yes; then
+    ac_cv_tcpstats=yes
+  fi
+  AC_MSG_RESULT($ac_cv_tcpstats)
+  if test "$ac_cv_tcpstats" = yes; then
+    AC_DEFINE([HAVE_TCP_STATS], 1, [Define to enable tcp stats support])
   fi
 fi
 
@@ -373,6 +415,9 @@ fi
 
 if test "$enable_fastsampling" = yes; then
 AC_DEFINE([HAVE_FASTSAMPLING], 1, [Define if fast sampling for report intervals is desired])
+fi
+if test "$enable_discover_defaultlen" = yes; then
+AC_DEFINE([DEFAULT_PAYLOAD_LEN_PER_MTU_DISCOVERY], 1, [Define if default UDP payload length is based on device MTU and socket buffer size])
 fi
 
 if test "$enable_packet_debug" = yes; then

@@ -71,6 +71,7 @@
 #include "isochronous.hpp"
 #include "pdfs.h"
 #include "payloads.h"
+#include "PerfSocket.hpp"
 #include <math.h>
 
 static int reversetest = 0;
@@ -79,6 +80,8 @@ static int histogram = 0;
 static int l2checks = 0;
 static int incrdstip = 0;
 static int incrsrcip = 0;
+static int incrdstport = 0;
+static int incrsrcport = 0;
 static int sumdstip = 0;
 static int txstarttime = 0;
 static int noconnectsync = 0;
@@ -104,6 +107,15 @@ static int txnotsentlowwater = 0;
 static int tapif = 0;
 static int tunif = 0;
 static int hideips = 0;
+static int bounceback = 0;
+static int bouncebackhold = 0;
+static int bouncebackperiod = 0;
+static int overridetos = 0;
+static int notcpbbquickack = 0;
+static int tcpquickack = 0;
+static int notcpbbquickack_cliset = 0;
+static int congest = 0;
+static int tcpwritetimes = 0;
 
 void Settings_Interpret(char option, const char *optarg, struct thread_Settings *mExtSettings);
 // apply compound settings after the command line has been fully parsed
@@ -122,6 +134,10 @@ static void generate_permit_key(struct thread_Settings *mExtSettings);
 const struct option long_options[] =
 {
 {"singleclient",     no_argument, NULL, '1'},
+#if 0
+{"v4",               no_argument, NULL, '4'},
+{"v6",               no_argument, NULL, '6'},
+#endif
 {"bandwidth",  required_argument, NULL, 'b'},
 {"client",     required_argument, NULL, 'c'},
 {"dualtest",         no_argument, NULL, 'd'},
@@ -147,6 +163,11 @@ const struct option long_options[] =
 // more esoteric options
 {"awdl",             no_argument, NULL, 'A'},
 {"bind",       required_argument, NULL, 'B'},
+{"bounceback", no_argument, &bounceback, 1},
+{"bounceback-congest", no_argument, &congest, 1},
+{"bounceback-hold", required_argument, &bouncebackhold, 1},
+{"bounceback-no-quickack", no_argument, &notcpbbquickack, 1},
+{"bounceback-period", required_argument, &bouncebackperiod, 1},
 {"compatibility",    no_argument, NULL, 'C'},
 {"daemon",           no_argument, NULL, 'D'},
 {"file_input", required_argument, NULL, 'F'},
@@ -174,6 +195,8 @@ const struct option long_options[] =
 {"l2checks", no_argument, &l2checks, 1},
 {"incr-dstip", no_argument, &incrdstip, 1},
 {"incr-srcip", no_argument, &incrsrcip, 1},
+{"incr-dstport", no_argument, &incrdstport, 1},
+{"incr-srcport", no_argument, &incrsrcport, 1},
 {"sum-dstip", no_argument, &sumdstip, 1},
 {"txstart-time", required_argument, &txstarttime, 1},
 {"txdelay-time", required_argument, &txholdback, 1},
@@ -191,10 +214,13 @@ const struct option long_options[] =
 {"near-congestion", optional_argument, &nearcongest, 1},
 {"permit-key", optional_argument, &permitkey, 1},
 {"permit-key-timeout", required_argument, &permitkeytimeout, 1},
-{"burst-size", optional_argument, &burstsize, 1},
-{"burst-period", optional_argument, &burstperiodic, 1},
+{"burst-size", required_argument, &burstsize, 1},
+{"burst-period", required_argument, &burstperiodic, 1},
+{"tos-override", required_argument, &overridetos, 1},
 {"tcp-rx-window-clamp", required_argument, &rxwinclamp, 1},
+{"tcp-quickack", no_argument, &tcpquickack, 1},
 {"tcp-write-prefetch", required_argument, &txnotsentlowwater, 1}, // see doc/DESIGN_NOTES
+{"tcp-write-times", no_argument, &tcpwritetimes, 1},
 {"tap-dev", optional_argument, &tapif, 1},
 {"tun-dev", optional_argument, &tunif, 1},
 {"NUM_REPORT_STRUCTS", required_argument, &numreportstructs, 1},
@@ -244,14 +270,14 @@ const struct option env_options[] =
 {"IPERF_TTL",        required_argument, NULL, 'T'},
 {"IPERF_SINGLE_UDP",       no_argument, NULL, 'U'},
 {"IPERF_SUGGEST_WIN_SIZE", required_argument, NULL, 'W'},
-{"IPERF_PEER_DETECT", required_argument, NULL, 'X'},
+{"IPERF_PEER_DETECT", no_argument, NULL, 'X'},
 {"IPERF_CONGESTION_CONTROL",  required_argument, NULL, 'Z'},
 {0, 0, 0, 0}
 };
 
 #define SHORT_OPTIONS()
 
-const char short_options[] = "1b:c:def:hi:l:mn:o:p:rst:uvw:x:y:zAB:CDF:H:IL:M:NP:RS:T:UVWXZ:";
+const char short_options[] = "146b:c:def:hi:l:mn:o:p:rst:uvw:x:y:zAB:CDF:H:IL:M:NP:RS:T:UVWXZ:";
 
 /* -------------------------------------------------------------------
  * defaults
@@ -259,12 +285,9 @@ const char short_options[] = "1b:c:def:hi:l:mn:o:p:rst:uvw:x:y:zAB:CDF:H:IL:M:NP
 #define DEFAULTS()
 
 const long kDefault_UDPRate = 1024 * 1024; // -u  if set, 1 Mbit/sec
-const int  kDefault_UDPBufLen = 1470;      // -u  if set, read/write 1470 bytes
-
-// v4: 1470 bytes UDP payload will fill one and only one ethernet datagram (IPv4 overhead is 20 bytes)
-const int  kDefault_UDPBufLenV6 = 1450;      // -u  if set, read/write 1470 bytes
-// v6: 1450 bytes UDP payload will fill one and only one ethernet datagram (IPv6 overhead is 40 bytes)
 const int kDefault_TCPBufLen = 128 * 1024; // TCP default read/write size
+const int kDefault_BBTCPBufLen = 100; // default bounce-back size in bytes
+
 
 /* -------------------------------------------------------------------
  * Initialize all settings to defaults.
@@ -413,6 +436,8 @@ void Settings_Copy (struct thread_Settings *from, struct thread_Settings **into,
     mbuflen += TAPBYTESSLOP;
 #endif
     (*into)->mBuf = new char[mbuflen];
+    memset((*into)->mBuf, 0, mbuflen);
+
 #ifdef HAVE_THREAD_DEBUG
     thread_debug("Copy Settings: MBUF malloc %d bytes (%p)", mbuflen, (void *) (*into)->mBuf);
 #endif
@@ -495,6 +520,14 @@ void Settings_Interpret (char option, const char *optarg, struct thread_Settings
     switch (option) {
         case '1': // Single Client
             setSingleClient(mExtSettings);
+            break;
+
+        case '4': // v4 only
+            setIPV4(mExtSettings);
+            break;
+
+        case '6': // v4 only
+            setIPV6(mExtSettings);
             break;
 
         case 'b': // UDP bandwidth
@@ -599,7 +632,9 @@ void Settings_Interpret (char option, const char *optarg, struct thread_Settings
             break;
 
         case 'm': // print TCP MSS
+#if HAVE_DECL_TCP_MAXSEG
             setPrintMSS(mExtSettings);
+#endif
             break;
 
         case 'n': // bytes of data
@@ -791,9 +826,11 @@ void Settings_Interpret (char option, const char *optarg, struct thread_Settings
             break;
 
         case 'M': // specify TCP MSS (maximum segment size)
-            mExtSettings->mMSS = byte_atoi(optarg);
-            setPrintMSS(mExtSettings);
+#if HAVE_DECL_TCP_MAXSEG
+	    mExtSettings->mMSS = byte_atoi(optarg);
             setTCPMSS(mExtSettings);
+            setPrintMSS(mExtSettings);
+#endif
             break;
 
         case 'N': // specify TCP nodelay option (disable Jacobson's Algorithm)
@@ -838,7 +875,7 @@ void Settings_Interpret (char option, const char *optarg, struct thread_Settings
             break;
 
         case 'V': // IPv6 Domain
-#ifdef HAVE_IPV6
+#if HAVE_IPV6
             setIPV6(mExtSettings);
 #else
 	    fprintf(stderr, "The --ipv6_domain (-V) option is not enabled in this build.\n");
@@ -870,9 +907,17 @@ void Settings_Interpret (char option, const char *optarg, struct thread_Settings
 		incrdstip = 0;
 		setIncrDstIP(mExtSettings);
 	    }
+	    if (incrdstport) {
+		incrdstport = 0;
+		setIncrDstPort(mExtSettings);
+	    }
 	    if (incrsrcip) {
 		incrsrcip = 0;
 		setIncrSrcIP(mExtSettings);
+	    }
+	    if (incrsrcport) {
+		incrsrcport = 0;
+		setIncrSrcPort(mExtSettings);
 	    }
 	    if (sumdstip) {
 		sumdstip = 0;
@@ -964,9 +1009,9 @@ void Settings_Interpret (char option, const char *optarg, struct thread_Settings
 		nearcongest = 0;
 		setNearCongest(mExtSettings);
 		if (optarg && (atof(optarg) >=  0.0)) {
-		    mExtSettings->rtt_nearcongest_divider = atof(optarg);
+		    mExtSettings->rtt_nearcongest_weight_factor = atof(optarg);
 		} else {
-		    mExtSettings->rtt_nearcongest_divider = NEARCONGEST_DEFAULT;
+		    mExtSettings->rtt_nearcongest_weight_factor = NEARCONGEST_DEFAULT;
 		}
 	    }
 	    if (permitkey) {
@@ -1002,6 +1047,11 @@ void Settings_Interpret (char option, const char *optarg, struct thread_Settings
 	    if (fullduplextest) {
 		fullduplextest = 0;
 		setFullDuplex(mExtSettings);
+	    }
+	    if (overridetos) {
+		overridetos = 0;
+		mExtSettings->mRTOS = strtol(optarg, NULL, 0);
+		setOverrideTOS(mExtSettings);
 	    }
 	    if (fqrate) {
 #if defined(HAVE_DECL_SO_MAX_PACING_RATE)
@@ -1046,17 +1096,30 @@ void Settings_Interpret (char option, const char *optarg, struct thread_Settings
 		fprintf(stderr, "--tcp-rx-window-clamp not supported on this platform\n");
 #endif
 	    }
+	    if (tcpwritetimes) {
+		tcpwritetimes = 0;
+		setTcpWriteTimes(mExtSettings);
+	    }
+	    if (notcpbbquickack) {
+		notcpbbquickack = 0;
+		notcpbbquickack_cliset = 1;
+	    }
+	    if (tcpquickack) {
+		tcpquickack = 0;
+#if HAVE_DECL_TCP_QUICKACK
+		setTcpQuickAck(mExtSettings);
+#endif
+	    }
+	    if (congest) {
+		congest= 0;
+		setCongest(mExtSettings);
+	    }
 	    if (txnotsentlowwater) {
 		txnotsentlowwater = 0;
 #if HAVE_DECL_TCP_NOTSENT_LOWAT
 		mExtSettings->mWritePrefetch = byte_atoi(optarg);
 		setWritePrefetch(mExtSettings);
 		setEnhanced(mExtSettings);
-		mExtSettings->mHistBins = 100000; // 10 seconds wide
-		mExtSettings->mHistBinsize = 100; // 100 usec bins
-		mExtSettings->mHistUnits = 6;  // usecs 10 pow(x)
-		mExtSettings->mHistci_lower = 5;
-		mExtSettings->mHistci_upper = 95;
 #else
 		fprintf(stderr, "--tcp-write-prefetch not supported on this platform\n");
 #endif
@@ -1064,12 +1127,17 @@ void Settings_Interpret (char option, const char *optarg, struct thread_Settings
 	    if (burstperiodic) {
 		burstperiodic = 0;
 		setPeriodicBurst(mExtSettings);
-		if (optarg) {
+		if (optarg && (atof(optarg) > 1e-5)) { // limit to 10 usecs
 		    mExtSettings->mFPS = 1.0/atof(optarg);
+		} else {
+		    if (atof(optarg) != 0)
+			fprintf(stderr, "WARN: burst-period too small, must be greater than 10 usecs\n");
+		    unsetPeriodicBurst(mExtSettings);
 		}
 	    }
 	    if (burstsize) {
 		burstsize = 0;
+		setPeriodicBurst(mExtSettings);
 		if (optarg) {
 		    mExtSettings->mBurstSize = byte_atoi(optarg);
 		}
@@ -1088,10 +1156,15 @@ void Settings_Interpret (char option, const char *optarg, struct thread_Settings
 		setTapDev(mExtSettings);
 		setEnhanced(mExtSettings);
 		setL2LengthCheck(mExtSettings);
+#else
+		fprintf(stderr, "ERROR: tap devices not supported\n");
+		exit(1);
 #endif
 	    }
 	    if (tunif) {
 		tunif = 0;
+		fprintf(stderr, "ERROR: tun devices not yet supported\n");
+		exit(1);
 #if HAVE_TUNTAP_TUN
 		if (optarg) {
 		    mExtSettings->mIfrname = static_cast<char *>(calloc(strlen(optarg) + 1, sizeof(char)));
@@ -1104,6 +1177,31 @@ void Settings_Interpret (char option, const char *optarg, struct thread_Settings
 	    if (hideips) {
 		hideips = 0;
 		setHideIPs(mExtSettings);
+	    }
+	    if (bounceback) {
+		bounceback = 0;
+		setBounceBack(mExtSettings);
+		setNoDelay(mExtSettings);
+		setEnhanced(mExtSettings);
+	    }
+	    if (bouncebackhold) {
+		bouncebackhold = 0;
+		if (optarg)
+		    //cli units is ms, working units is us
+		    mExtSettings->mBounceBackHold = int(atof(optarg) * 1e3);
+		else
+		    mExtSettings->mBounceBackHold = 0;
+	    }
+	    if (bouncebackperiod) {
+		bouncebackperiod = 0;
+		setPeriodicBurst(mExtSettings);
+		if (optarg && (atof(optarg) > 1e-2)) { // limit to 10 usecs
+		    mExtSettings->mFPS = 1e3/atof(optarg); // cli units is ms
+		} else {
+		    if (atof(optarg) != 0)
+			fprintf(stderr, "WARN: bouncback-period too small, must be greater than 10 usecs\n");
+		    unsetPeriodicBurst(mExtSettings);
+		}
 	    }
 	    break;
         default: // ignore unknown
@@ -1186,7 +1284,10 @@ void Settings_ModalOptions (struct thread_Settings *mExtSettings) {
 		mExtSettings->mBufLen = kDefault_UDPBufLen;
 	    }
 	} else {
-	    mExtSettings->mBufLen = kDefault_TCPBufLen;
+	    if (isBounceBack(mExtSettings))
+	        mExtSettings->mBufLen = kDefault_BBTCPBufLen;
+	    else
+	        mExtSettings->mBufLen = kDefault_TCPBufLen;
 	}
     }
     if (!mExtSettings->mPortLast)
@@ -1229,6 +1330,12 @@ void Settings_ModalOptions (struct thread_Settings *mExtSettings) {
 	fprintf(stderr, "ERROR: compatibility mode not supported with the requested with options\n");
 	bail = true;
     }
+#if !(HAVE_DECL_IP_TOS)
+    if (isOverrideTOS(mExtSettings) || mExtSettings->mTOS) {
+	unsetOverrideTOS(mExtSettings);
+	fprintf(stderr, "WARN: IP_TOS not supported\n");
+    }
+#endif
     if (isPermitKey(mExtSettings)) {
 	if (isUDP(mExtSettings)) {
 	    fprintf(stderr, "ERROR: Option of --permit-key not supported with UDP\n");
@@ -1244,6 +1351,17 @@ void Settings_ModalOptions (struct thread_Settings *mExtSettings) {
 	    }
 	}
     }
+#if !HAVE_IPV6
+    if (isIPV6(mExtSettings)) {
+	fprintf(stderr, "ERROR: ipv6 not supported\n");
+	bail = true;
+    }
+#endif
+    if (isIPV4(mExtSettings) && isIPV6(mExtSettings)) {
+	fprintf(stderr, "WARN: both ipv4 and ipv6 set\n");
+	unsetIPV6(mExtSettings);
+	unsetIPV4(mExtSettings);
+    }
     if (mExtSettings->mThreadMode == kMode_Client) {
 	if (isRemoveService(mExtSettings)) {
 	    // -R on the client is overloaded and is the
@@ -1258,9 +1376,17 @@ void Settings_ModalOptions (struct thread_Settings *mExtSettings) {
 	if (isSumServerDstIP(mExtSettings)) {
 	    fprintf(stderr, "WARN: option of --sum-dstip not supported on the client\n");
 	}
+	if (isOverrideTOS(mExtSettings)) {
+	    unsetOverrideTOS(mExtSettings);
+	    fprintf(stderr, "WARN: option of --tos-override not supported on the client\n");
+	}
 	if (isRxClamp(mExtSettings)) {
 	    fprintf(stderr, "WARN: option of --tcp-rx-window-clamp not supported on the client\n");
 	    unsetRxClamp(mExtSettings);
+	}
+	if (isIncrSrcPort(mExtSettings) && !mExtSettings->mBindPort) {
+	    fprintf(stderr, "WARN: option of --incr-srcport requires -B bind option w/port to be set\n");
+	    unsetIncrSrcPort(mExtSettings);
 	}
 	if (isPeriodicBurst(mExtSettings)) {
 	    setEnhanced(mExtSettings);
@@ -1302,6 +1428,25 @@ void Settings_ModalOptions (struct thread_Settings *mExtSettings) {
 		bail = true;
 	    }
 	}
+	if (isBounceBack(mExtSettings)) {
+	    if (static_cast<int> (mExtSettings->mBurstSize) > 0) {
+		fprintf(stderr, "WARN: options of --burst-size for bounce-back ignored, use -l sets size\n");
+	    }
+	    mExtSettings->mBounceBackBytes = mExtSettings->mBufLen;
+	    mExtSettings->mBurstSize = mExtSettings->mBufLen;
+#if HAVE_DECL_TCP_QUICKACK
+	    if (notcpbbquickack_cliset && isTcpQuickAck(mExtSettings)) {
+		fprintf(stderr, "ERROR: --tcp-quickack and --bounceback-no-quickack are mutually exclusive\n");
+		bail = true;
+	    }
+	    // be wary of double negatives here
+	    if (!notcpbbquickack_cliset && (mExtSettings->mBounceBackHold > 0)) {
+		setTcpQuickAck(mExtSettings);
+	    }
+#endif
+
+	}
+
 	if (isPeriodicBurst(mExtSettings)) {
 	    if (isIsochronous(mExtSettings)) {
 		fprintf(stderr, "ERROR: options of --burst-period and --isochronous cannot be applied together\n");
@@ -1313,10 +1458,10 @@ void Settings_ModalOptions (struct thread_Settings *mExtSettings) {
 	        mExtSettings->mBurstSize = byte_atoi("1M"); //default to 1 Mbyte
 	    }
 	    if (static_cast<int> (mExtSettings->mBurstSize) < mExtSettings->mBufLen) {
-		fprintf(stderr, "ERROR: option of --burst-size must be equal or larger to write length (-l)\n");
+		fprintf(stderr, "ERROR: option of --burst-size %d must be equal or larger to write length (-l) %d\n", mExtSettings->mBurstSize, mExtSettings->mBufLen);
 		bail = true;
 	    }
-	} else if (static_cast<int> (mExtSettings->mBurstSize) > 0) {
+	} else if (!isBounceBack(mExtSettings) && (static_cast<int> (mExtSettings->mBurstSize) > 0)) {
 	    setPeriodicBurst(mExtSettings);
 	    mExtSettings->mFPS = 1.0;
 	    fprintf(stderr, "WARN: option of --burst-size without --burst-period defaults --burst-period to 1 second\n");
@@ -1347,9 +1492,14 @@ void Settings_ModalOptions (struct thread_Settings *mExtSettings) {
 		bail = true;
 	    }
 	    if (isWritePrefetch(mExtSettings)) {
-		fprintf(stderr, "WARN: setting of option --tcp-write-prefetch is not with -u UDP\n");
+		fprintf(stderr, "WARN: setting of option --tcp-write-prefetch is not supported with -u UDP\n");
 		unsetWritePrefetch(mExtSettings);
 	    }
+	    if (isTcpQuickAck(mExtSettings)) {
+		fprintf(stderr, "WARN: setting of option --tcp-quickack is not supported with -u UDP\n");
+		unsetWritePrefetch(mExtSettings);
+	    }
+
 	    {
 		double delay_target;
 		if (isIPG(mExtSettings)) {
@@ -1380,17 +1530,10 @@ void Settings_ModalOptions (struct thread_Settings *mExtSettings) {
 		}
 	    }
 	} else {
-#ifndef HAVE_STRUCT_TCP_INFO_TCPI_TOTAL_RETRANS
-	    if (isNearCongest(mExtSettings)) {
-		fprintf(stderr, "ERROR: option of --near-congestion not supported on this platform\n");
-		bail = true;
-	    }
-#else
 	    if ((mExtSettings->mAppRate > 0) && isNearCongest(mExtSettings)) {
 		fprintf(stderr, "ERROR: option of --near-congestion and -b rate limited are mutually exclusive\n");
 		bail = true;
 	    }
-#endif
 	    if (isBWSet(mExtSettings) && !(mExtSettings->mAppRateUnits == kRate_PPS) \
 		&& ((mExtSettings->mAppRate / 8) < static_cast<uintmax_t>(mExtSettings->mBufLen))) {
 		fprintf(stderr, "ERROR: option -b and -l of %d are incompatible, consider setting -l to %d or lower\n", \
@@ -1414,8 +1557,13 @@ void Settings_ModalOptions (struct thread_Settings *mExtSettings) {
 		bail = true;
 	    }
 	}
-	if (isHistogram(mExtSettings) && !isWritePrefetch(mExtSettings)) {
-	    fprintf(stderr, "WARN: option of --histograms on the client requires --tcp-write-prefetch\n");
+	if (!isReverse(mExtSettings) && !isFullDuplex(mExtSettings) && isHistogram(mExtSettings)){
+	    setTcpWriteTimes(mExtSettings);
+	    mExtSettings->mHistBins = 100000; // 10 seconds wide
+	    mExtSettings->mHistBinsize = 100; // 100 usec bins
+	    mExtSettings->mHistUnits = 6;  // usecs 10 pow(x)
+	    mExtSettings->mHistci_lower = 5;
+	    mExtSettings->mHistci_upper = 95;
 	}
 	if (isCongestionControl(mExtSettings) && isReverse(mExtSettings)) {
 	    fprintf(stderr, "ERROR: tcp congestion control -Z and --reverse cannot be applied together\n");
@@ -1451,6 +1599,10 @@ void Settings_ModalOptions (struct thread_Settings *mExtSettings) {
 		mExtSettings->mListenerTimeout = DEFAULT_PERMITKEY_LIFE;
 	    }
 	}
+        if (isBounceBack(mExtSettings)) {
+            fprintf(stderr, "ERROR: setting of option --bounce-back is not supported on the server\n");
+	    bail = true;
+	}
         if (isTripTime(mExtSettings)) {
             fprintf(stderr, "WARN: setting of option --trip-times is not supported on the server\n");
 	}
@@ -1483,7 +1635,7 @@ void Settings_ModalOptions (struct thread_Settings *mExtSettings) {
 	    fprintf(stderr, "WARN: option of --reverse is not supported on the server\n");
 	}
 	if (isIncrDstIP(mExtSettings)) {
-	    fprintf(stderr, "WARN: option of --incr-dstpip is not supported on the server\n");
+	    fprintf(stderr, "WARN: option of --incr-dstip is not supported on the server\n");
 	}
 	if (isFQPacing(mExtSettings)) {
 	    fprintf(stderr, "WARN: option of --fq-rate is not supported on the server\n");
@@ -1548,6 +1700,8 @@ void Settings_ModalOptions (struct thread_Settings *mExtSettings) {
 		}
 		mExtSettings->mHistBinsize = atoi(tmp);
 		delete [] tmp;
+		mExtSettings->mHistci_lower = 5;
+		mExtSettings->mHistci_upper = 95;
 		if ((results = strtok(results+strlen(results)+1, ",")) != NULL) {
 		    mExtSettings->mHistBins = byte_atoi(results);
 		    if ((results = strtok(NULL, ",")) != NULL) {
@@ -1661,8 +1815,19 @@ void Settings_ModalOptions (struct thread_Settings *mExtSettings) {
 	    fprintf(stderr, "WARNING: Client src addr (per -B) must be ip unicast\n");
 	}
     }
-    // Parse client (-c) addresses for multicast, link-local and bind to device
+    // Parse client (-c) addresses for multicast, link-local and bind to device, port incr
     if (mExtSettings->mThreadMode == kMode_Client) {
+	if (mExtSettings->mPortLast > mExtSettings->mPort) {
+	    int prcnt = ((mExtSettings->mPortLast - mExtSettings->mPort) + 1);
+	    int threads_needed = (prcnt > mExtSettings->mThreads) ? prcnt : mExtSettings->mThreads;
+	    if (mExtSettings->mThreads < prcnt) {
+		fprintf(stderr, "WARNING: port-range and -P mismatch (adjusting -P to %d)\n", threads_needed);
+		mExtSettings->mThreads = threads_needed;
+	    } else if ((mExtSettings->mThreads > 1) && (threads_needed > prcnt)) {
+		fprintf(stderr, "WARNING: port-range and -P mismatch (adjusting port-range to %d-%d)\n", \
+			mExtSettings->mPort, mExtSettings->mPort + threads_needed);
+	    }
+	}
 	mExtSettings->mIfrnametx = NULL; // default off SO_BINDTODEVICE
 	if (((results = strtok(mExtSettings->mHost, "%")) != NULL) && ((results = strtok(NULL, "%")) != NULL)) {
 	    mExtSettings->mIfrnametx = static_cast<char *>(calloc(strlen(results) + 1, sizeof(char)));
@@ -1804,8 +1969,14 @@ void Settings_ReadClientSettingsV1 (struct thread_Settings **client, struct clie
     (*client)->mTID = thread_zeroid();
     (*client)->mPort = static_cast<unsigned short>(ntohl(hdr->mPort));
     (*client)->mThreads = 1;
+    struct thread_Settings *tmpSettings  = *client;
     if (hdr->mBufLen != 0) {
 	(*client)->mBufLen = ntohl(hdr->mBufLen);
+	setBuflenSet(tmpSettings);
+    } else {
+#ifdef DEFAULT_PAYLOAD_LEN_PER_MTU_DISCOVERY
+	checksock_max_udp_payload(tmpSettings);
+#endif
     }
     (*client)->mAmount = ntohl(hdr->mAmount);
     if (((*client)->mAmount & 0x80000000) > 0) {
@@ -1902,6 +2073,7 @@ void Settings_GenerateClientSettings (struct thread_Settings *server, struct thr
     } else { //tcp first payload
 	struct client_tcp_testhdr *hdr = static_cast<struct client_tcp_testhdr *>(mBuf);
 	Settings_ReadClientSettingsV1(&reversed_thread, &hdr->base);
+
 	if (isFullDuplex(server) || v1test) {
 	    server->mAmount = reversed_thread->mAmount + (SLOPSECS * 100);
 	}
@@ -1945,7 +2117,7 @@ void Settings_GenerateClientSettings (struct thread_Settings *server, struct thr
 	    inet_ntop(AF_INET, &(reinterpret_cast<sockaddr_in*>(&server->peer))->sin_addr,
 		      reversed_thread->mHost, REPORT_ADDRLEN);
 	}
-#ifdef HAVE_IPV6
+#if HAVE_IPV6
 	else {
 	    inet_ntop(AF_INET6, &(reinterpret_cast<sockaddr_in6*>(&server->peer))->sin6_addr,
 		      reversed_thread->mHost, REPORT_ADDRLEN);
@@ -2010,7 +2182,10 @@ int Settings_GenerateClientHdr (struct thread_Settings *client, void *testhdr, s
 
     // Check the corner case of small packets and trip times
     if (isUDP(client) && isSmallTripTime(client)) {
+        int buflen = (client->mBufLen < (int) sizeof(struct client_udpsmall_testhdr)) ? client->mBufLen \
+	             : sizeof(struct client_udpsmall_testhdr);
 	struct client_udpsmall_testhdr *hdr = static_cast<struct client_udpsmall_testhdr *>(testhdr);
+	memset(hdr, 0, buflen);
 	hdr->flags = htons(HEADER16_SMALL_TRIPTIMES);
 #ifdef HAVE_THREAD_DEBUG
 	thread_debug("UDP small trip times flags = %X", ntohs(hdr->flags));
@@ -2031,7 +2206,9 @@ int Settings_GenerateClientHdr (struct thread_Settings *client, void *testhdr, s
     // Now setup UDP and TCP specific passed settings from client to server
     if (isUDP(client)) { // UDP test information passed in every packet per being stateless
 	struct client_udp_testhdr *hdr = static_cast<struct client_udp_testhdr *>(testhdr);
-	memset(hdr, 0, sizeof(struct client_udp_testhdr));
+        int buflen = (client->mBufLen < (int) sizeof(struct client_udp_testhdr)) ? client->mBufLen \
+	             : sizeof(struct client_udp_testhdr);
+	memset(hdr, 0, buflen);
 	flags |= HEADER_SEQNO64B; // use 64 bit by default
 	flags |= HEADER_EXTEND;
 	hdr->extend.version_u = htonl(IPERF_VERSION_MAJORHEX);
@@ -2133,89 +2310,101 @@ int Settings_GenerateClientHdr (struct thread_Settings *client, void *testhdr, s
 #ifdef HAVE_THREAD_DEBUG
 	thread_debug("Client header init size %d (%p)", sizeof(struct client_tcp_testhdr), (void *) hdr);
 #endif
-	memset(hdr, 0, sizeof(struct client_tcp_testhdr));
-	flags |= HEADER_EXTEND;
-	hdr->extend.version_u = htonl(IPERF_VERSION_MAJORHEX);
-	hdr->extend.version_l = htonl(IPERF_VERSION_MINORHEX);
-	hdr->extend.tos = htons(client->mTOS & 0xFF);
-	if (isBWSet(client)) {
-	    hdr->extend.lRate = htonl((uint32_t)(client->mAppRate));
+	if (isBounceBack(client)) {
+	    flags = HEADER_BOUNCEBACK;
+	    len = sizeof(struct bounceback_hdr);
+	} else {
+	    int buflen = (client->mBufLen < (int) sizeof(struct client_tcp_testhdr)) ? client->mBufLen \
+	                 : sizeof(struct client_tcp_testhdr);
+	    memset(hdr, 0, buflen);
+	    flags |= HEADER_EXTEND;
+	    hdr->extend.version_u = htonl(IPERF_VERSION_MAJORHEX);
+	    hdr->extend.version_l = htonl(IPERF_VERSION_MINORHEX);
+	    hdr->extend.tos = htons(client->mTOS & 0xFF);
+	    if (isBWSet(client)) {
+		hdr->extend.lRate = htonl((uint32_t)(client->mAppRate));
 #ifdef HAVE_INT64_T
-	    hdr->extend.uRate = htonl(((uint32_t)(client->mAppRate >> 32)) << 8);
+		hdr->extend.uRate = htonl(((uint32_t)(client->mAppRate >> 32)) << 8);
 #endif
-	}
-	len += sizeof(struct client_hdrext);
-	len += Settings_GenerateClientHdrV1(client, &hdr->base);
-	if (!isCompat(client) && (client->mMode != kTest_Normal)) {
-	    flags |= HEADER_VERSION1;
-	    if (client->mMode == kTest_DualTest)
-		flags |= RUN_NOW;
-	}
-	if (isPeerVerDetect(client)) {
-	    flags |= (HEADER_V2PEERDETECT | HEADER_VERSION2);
-	}
-	if (isTripTime(client) || isFQPacing(client) || isIsochronous(client) || isTxStartTime(client)) {
-	    hdr->start_fq.start_tv_sec = htonl(startTime.tv_sec);
-	    hdr->start_fq.start_tv_usec = htonl(startTime.tv_usec);
-	    hdr->start_fq.fqratel = htonl((uint32_t) client->mFQPacingRate);
+	    }
+	    len += sizeof(struct client_hdrext);
+	    len += Settings_GenerateClientHdrV1(client, &hdr->base);
+	    if (!isCompat(client) && (client->mMode != kTest_Normal)) {
+		flags |= HEADER_VERSION1;
+		if (client->mMode == kTest_DualTest)
+		    flags |= RUN_NOW;
+	    }
+	    if (isPeerVerDetect(client)) {
+		flags |= (HEADER_V2PEERDETECT | HEADER_VERSION2);
+	    }
+	    if (isTripTime(client) || isFQPacing(client) || isIsochronous(client) || isTxStartTime(client)) {
+		hdr->start_fq.start_tv_sec = htonl(startTime.tv_sec);
+		hdr->start_fq.start_tv_usec = htonl(startTime.tv_usec);
+		hdr->start_fq.fqratel = htonl((uint32_t) client->mFQPacingRate);
 #ifdef HAVE_INT64_T
-	    hdr->start_fq.fqrateu = htonl((uint32_t) (client->mFQPacingRate >> 32));
+		hdr->start_fq.fqrateu = htonl((uint32_t) (client->mFQPacingRate >> 32));
 #endif
-	    len += sizeof(struct client_hdrext_starttime_fq);
-	    // Set flags on
-	    if (isTripTime(client)) {
-		upperflags |= HEADER_TRIPTIME;
-	    }
-	    if (isFQPacing(client)) {
-		upperflags |= HEADER_FQRATESET;
-	    }
-	}
-#if HAVE_DECL_TCP_NOTSENT_LOWAT
-	if (isWritePrefetch(client) && (isReverse(client) || isFullDuplex(client))) {
-	    upperflags  |= HEADER_WRITEPREFETCH;
-		hdr->extend.TCPWritePrefetch = htonl((long)client->mWritePrefetch);
-	}
-#endif
-	if (isIsochronous(client) || isPeriodicBurst(client)) {
-	    if (isPeriodicBurst(client)) {
-		upperflags |= HEADER_PERIODICBURST;  // overload the isoch settings
-	    } else {
-		upperflags |= HEADER_ISOCH;
-	    }
-	    if (isFullDuplex(client) || isReverse(client) || isPeriodicBurst(client)) {
-		hdr->isoch_settings.FPSl = htonl((long)client->mFPS);
-		hdr->isoch_settings.FPSu = htonl((long)((client->mFPS - (long)(client->mFPS)) * rMillion));
-		hdr->isoch_settings.Variancel = htonl((long)(client->mVariance));
-		hdr->isoch_settings.Varianceu = htonl((long)((client->mVariance - (long)(client->mVariance)) * rMillion));
-		if (!isPeriodicBurst(client)) {
-		    hdr->isoch_settings.Meanl = htonl((long)(client->mMean));
-		    hdr->isoch_settings.Meanu = htonl((long)(((client->mMean) - (long)(client->mMean)) * rMillion));
-		    hdr->isoch_settings.BurstIPGl = htonl((long)client->mBurstIPG);
-		    hdr->isoch_settings.BurstIPGu = htonl(((long)(client->mBurstIPG) - (long)client->mBurstIPG * rMillion));
-		} else {
-		    hdr->isoch_settings.Meanl = htonl((long)(client->mBurstSize));
+		len += sizeof(struct client_hdrext_starttime_fq);
+		// Set flags on
+		if (isTripTime(client)) {
+		    upperflags |= HEADER_TRIPTIME;
 		}
-		len += sizeof(struct client_hdrext_isoch_settings);
+		if (isFQPacing(client)) {
+		    upperflags |= HEADER_FQRATESET;
+		}
 	    }
-	}
-	if (isReverse(client) || isFullDuplex(client)) {
-	    flags |= HEADER_VERSION2;
-	}
-	hdr->extend.upperflags = htons(upperflags);
-	hdr->extend.lowerflags = htons(lowerflags);
-	if (len > 0) {
-	    flags |= HEADER_LEN_BIT;
-	    int keylen = 0;
-	    if (!isServerReverse(client) && isPermitKey(client) && (client->mPermitKey[0] != '\0')) {
-		keylen = static_cast<int>(strnlen(client->mPermitKey, MAX_PERMITKEY_LEN));
-		flags |= HEADER_KEYCHECK;
-		struct permitKey *thiskey = reinterpret_cast<struct permitKey *>(static_cast<char *>(testhdr) + len);
-		thiskey->length = htons((uint16_t)keylen);
-		memcpy(thiskey->value, client->mPermitKey, keylen);
-		len += sizeof(thiskey->length);
+#if HAVE_DECL_TCP_NOTSENT_LOWAT
+	    if (isWritePrefetch(client) && (isReverse(client) || isFullDuplex(client))) {
+		upperflags  |= HEADER_WRITEPREFETCH;
+		hdr->extend.TCPWritePrefetch = htonl((long)client->mWritePrefetch);
 	    }
-	    flags |= ((len << 1) & HEADER_KEYLEN_MASK); // this is the key value offset passed to the server
-	    len += keylen;
+#endif
+#if HAVE_DECL_TCP_QUICKACK
+	    if (isTcpQuickAck(client) && (!isReverse(client) || isFullDuplex(client))) {
+		upperflags  |= HEADER_TCPQUICKACK;
+	    }
+#endif
+	    if (isIsochronous(client) || isPeriodicBurst(client)) {
+		if (isPeriodicBurst(client)) {
+		    upperflags |= HEADER_PERIODICBURST;  // overload the isoch settings
+		} else {
+		    upperflags |= HEADER_ISOCH;
+		}
+		if (isFullDuplex(client) || isReverse(client) || isPeriodicBurst(client)) {
+		    hdr->isoch_settings.FPSl = htonl((long)client->mFPS);
+		    hdr->isoch_settings.FPSu = htonl((long)((client->mFPS - (long)(client->mFPS)) * rMillion));
+		    hdr->isoch_settings.Variancel = htonl((long)(client->mVariance));
+		    hdr->isoch_settings.Varianceu = htonl((long)((client->mVariance - (long)(client->mVariance)) * rMillion));
+		    if (!isPeriodicBurst(client)) {
+			hdr->isoch_settings.Meanl = htonl((long)(client->mMean));
+			hdr->isoch_settings.Meanu = htonl((long)(((client->mMean) - (long)(client->mMean)) * rMillion));
+			hdr->isoch_settings.BurstIPGl = htonl((long)client->mBurstIPG);
+			hdr->isoch_settings.BurstIPGu = htonl(((long)(client->mBurstIPG) - (long)client->mBurstIPG * rMillion));
+		    } else {
+			hdr->isoch_settings.Meanl = htonl((long)(client->mBurstSize));
+		    }
+		    len += sizeof(struct client_hdrext_isoch_settings);
+		}
+	    }
+	    if (isReverse(client) || isFullDuplex(client)) {
+		flags |= HEADER_VERSION2;
+	    }
+	    hdr->extend.upperflags = htons(upperflags);
+	    hdr->extend.lowerflags = htons(lowerflags);
+	    if (len > 0) {
+		flags |= HEADER_LEN_BIT;
+		int keylen = 0;
+		if (!isServerReverse(client) && isPermitKey(client) && (client->mPermitKey[0] != '\0')) {
+		    keylen = static_cast<int>(strnlen(client->mPermitKey, MAX_PERMITKEY_LEN));
+		    flags |= HEADER_KEYCHECK;
+		    struct permitKey *thiskey = reinterpret_cast<struct permitKey *>(static_cast<char *>(testhdr) + len);
+		    thiskey->length = htons((uint16_t)keylen);
+		    memcpy(thiskey->value, client->mPermitKey, keylen);
+		    len += sizeof(thiskey->length);
+		}
+		flags |= ((len << 1) & HEADER_KEYLEN_MASK); // this is the key value offset passed to the server
+		len += keylen;
+	    }
 	}
 	hdr->base.flags = htonl(flags);
     }

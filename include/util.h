@@ -70,8 +70,6 @@ extern int sInterupted;
 int setsock_tcp_windowsize(int inSock, int inTCPWin, int inSend);
 int getsock_tcp_windowsize(int inSock, int inSend);
 
-void setsock_tcp_mss(int inSock, int inMSS);
-int  getsock_tcp_mss(int inSock);
 bool setsock_blocking(int fd, bool blocking);
 #if HAVE_DECL_TCP_WINDOW_CLAMP
 int  getsock_tcp_windowclamp(int inSock);
@@ -82,9 +80,10 @@ int  getsock_tcp_notsent_low_watermark(int inSock);
 int  setsock_tcp_notsent_low_watermark(int inSock, int clampsize);
 #endif
 int recvn(int inSock, char *outBuf, int inLen, int flags);
-int writen(int inSock, const void *inBuf, int inLen);
+int writen(int inSock, const void *inBuf, int inLen, int *count);
 
 void disarm_itimer(void);
+int set_itimer(int);
 /* -------------------------------------------------------------------
  * signal handlers
  * signal.c
@@ -193,8 +192,11 @@ void byte_snprintf(char* outString, int inLen, double inNum, char inFormat);
 
 #define TimeZero(timeval) ((timeval.tv_sec == 0) && (timeval.tv_usec == 0))
 
-#define TimeDifference(left, right) (left.tv_sec  - right.tv_sec) +   \
-        (left.tv_usec - right.tv_usec) / ((double) rMillion)
+#define TimeDifference(left, right) ((left.tv_sec  - right.tv_sec) +	\
+				     (left.tv_usec - right.tv_usec) / ((double) rMillion))
+
+#define TimeDifferenceUsec(left, right)  ((1e6 * (left.tv_sec  - right.tv_sec)) + \
+					  (double) (left.tv_usec - right.tv_usec))
 
 #define TimeDouble(timeval) (timeval.tv_sec + timeval.tv_usec / ((double) rMillion))
 
@@ -245,8 +247,7 @@ void redirect(const char *inOutputFileName);
 // Define fatal and nonfatal write errors
 #ifdef WIN32
 #define FATALTCPREADERR(errno) (WSAGetLastError() != WSAEWOULDBLOCK)
-#define FATALUDPREADERR(errno)  (((errno = WSAGetLastError()) != WSAEWOULDBLOCK) \
-				 && (errno != WSAECONNREFUSED))
+#define FATALUDPREADERR(errno)  (((errno = WSAGetLastError()) != WSAEWOULDBLOCK))
 #define FATALTCPWRITERR(errno)  ((errno = WSAGetLastError()) != WSAETIMEDOUT)
 #define NONFATALTCPWRITERR(errno) ((errno = WSAGetLastError()) == WSAETIMEDOUT)
 #define FATALUDPWRITERR(errno)  (((errno = WSAGetLastError()) != WSAETIMEDOUT) \
@@ -254,7 +255,7 @@ void redirect(const char *inOutputFileName);
 #else
 #define FATALTCPREADERR(errno) ((errno != EAGAIN) && (errno != EWOULDBLOCK) && (errno != EINTR))
 #define FATALUDPREADERR(errno) ((errno != EAGAIN) && (errno != EWOULDBLOCK) && \
-				(errno != EINTR) && (errno != ECONNREFUSED))
+				(errno != EINTR))
 #define FATALTCPWRITERR(errno)  (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR)
 #define NONFATALTCPWRITERR(errno)  (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)
 #define FATALUDPWRITERR(errno) 	((errno != EAGAIN) && (errno != EWOULDBLOCK) && (errno != EINTR) \

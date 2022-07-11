@@ -72,11 +72,13 @@ extern "C" {
 #define HEADER_VERSION1      0x80000000
 #define HEADER_EXTEND        0x40000000
 #define HEADER_UDPTESTS      0x20000000
+#define HEADER_BOUNCEBACK    0x10000000
 #define HEADER_SEQNO64B      0x08000000
 #define HEADER_VERSION2      0x04000000
-#define HEADER_AVOID2        0x02000000
-#define HEADER_AVOID1        0x01000000
 #define HEADER_V2PEERDETECT  0x02000000
+#define HEADER_UDPAVOID2     0x02000000
+#define HEADER_UDPAVOID1     0x01000000
+
 #define HEADER32_SMALL_TRIPTIMES 0x00020000
 #define HEADER_LEN_BIT       0x00010000
 #define HEADER_LEN_MASK      0x000001FE
@@ -84,6 +86,11 @@ extern "C" {
 #define SERVER_HEADER_EXTEND 0x40000000
 #define RUN_NOW              0x00000001
 #define HEADER16_SMALL_TRIPTIMES 0x0002 // use is 16 bits and not 32 bits
+
+// Bounceback flag
+#define HEADER_BBQUICKACK    0x8000
+#define HEADER_BBCLOCKSYNCED 0x4000 // used in the bb header only
+#define HEADER_BBTOS         0x2000
 
 // newer flags available per HEADER_EXTEND
 // Below flags are used to pass test settings in *every* UDP packet
@@ -103,11 +110,11 @@ extern "C" {
 #define HEADER_EPOCH_START    0x1000
 #define HEADER_PERIODICBURST  0x2000
 #define HEADER_WRITEPREFETCH  0x4000
+#define HEADER_TCPQUICKACK    0x8000
 
 // later features
 #define HDRXACKMAX 2500000 // default 2.5 seconds, units microseconds
-#define HDRXACKMIN   10000 // default 10 ms, units microseconds
-
+#define HDRXACKMIN   10000 // default 10 ms, units microsecond
 /*
  * Structures used for test messages which
  * are exchanged between the client and the Server/Listener
@@ -182,6 +189,44 @@ struct client_hdr_v1 {
     int32_t mBufLen;
     int32_t mWinBand;
     int32_t mAmount;
+};
+
+//
+// Payload used for the bounce back feature
+//
+// Notes:
+//    o) flags is standard iperf 2 flags for test exchange info
+//    o) burst size is the payload size and size of bounce back write
+//    o) burst id is a running seq no
+//    o) send is the write timestamp
+//    o) bb_r2w_hold is an optional delay value between the read and bb write, typically expected as zero
+//    o) triptimes will support OWD measurements in each direction (useful for asymmetry testing)
+//    o) min payload
+//         - seven 32b or 28 bytes with round trip only,
+//	   - eleven 32b or 44 bytes when including trip-times support
+//    o) no need for a bb read timestamp to be passed in the payload
+//    o) OWD calculations require e2e clock sync and --trip-times cli option
+//    o) no need to copy bb payload as rx buffer with be used for bounce back write
+//    o) single threaded design
+//    o) these are packed, be careful that the union doesn't break this
+//
+
+struct bb_ts {
+    uint32_t sec;
+    uint32_t usec;
+};
+struct bounceback_hdr {
+    uint32_t flags;
+    uint32_t bbsize;
+    uint32_t bbid;
+    uint16_t bbflags;
+    uint16_t tos;
+    struct bb_ts bbclientTx_ts;
+    struct bb_ts bbserverRx_ts;
+    struct bb_ts bbserverTx_ts;
+    uint32_t bbhold; // up to here is mandatory
+    uint32_t bbrtt;
+    struct bb_ts bbread_ts;
 };
 
 struct client_hdrext_isoch_settings {
@@ -565,7 +610,7 @@ struct server_hdr {
 #define SIZEOF_UDPHDRMSG_EXT (sizeof(struct client_udp_testhdr))
 #define SIZEOF_TCPHDRMSG_V1 (sizeof(struct client_hdr_v1))
 #define SIZEOF_TCPHDRMSG_EXT (sizeof(struct client_tcp_testhdr))
-#define MINMBUFALLOCSIZE (int) (sizeof(struct client_tcp_testhdr))
+#define MINMBUFALLOCSIZE (int) (sizeof(struct client_tcp_testhdr)) + TAPBYTESSLOP
 #define MINTRIPTIMEPLAYOAD (int) (sizeof(struct client_udp_testhdr) - sizeof(struct client_hdrext_isoch_settings))
 #ifdef __cplusplus
 } /* end extern "C" */

@@ -82,11 +82,13 @@ public:
     bool isConnected(void) const;
     int SendFirstPayload(void);
     int BarrierClient(struct BarrierMutex *);
+    void RunBounceBackTCP(void);
     struct ReportHeader *myJob;
 
 private:
     inline void WritePacketID(intmax_t);
     inline void WriteTcpTxHdr(struct ReportStruct *, int, int);
+    inline void WriteTcpTxBBHdr(struct ReportStruct *, int);
     inline double get_delay_target(void);
     void InitTrafficLoop(void);
     void SetReportStartTime(void);
@@ -96,6 +98,7 @@ private:
     bool InProgress(void);
     void PostNullEvent(void);
     void AwaitServerCloseEvent(void);
+    inline void tcp_shutdown(void);
     bool connected;
     ReportStruct scratchpad;
     ReportStruct *reportstruct;
@@ -104,11 +107,8 @@ private:
     bool one_report;
     bool apply_first_udppkt_delay;
     int udp_payload_minimum;
-    void myReportPacket (void);
-#ifdef HAVE_STRUCT_TCP_INFO_TCPI_TOTAL_RETRANS
-    struct tcp_info my_tcpi_stats;
-    bool myReportPacket (bool sample_tcpi);
-#endif
+    void myReportPacket(void);
+
     // TCP plain
     void RunTCP(void);
     // TCP version which supports rate limiting per -b
@@ -139,6 +139,7 @@ private:
     Isochronous::FrameCounter *framecounter;
     bool isburst;
     bool peerclose;
+    Timestamp write_start;
 }; // end class Client
 
 #endif // CLIENT_H
