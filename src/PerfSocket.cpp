@@ -201,23 +201,8 @@ void SetSocketOptions (struct thread_Settings *inSettings) {
 	WARN_errno(rc == SOCKET_ERROR, "v4 ttl");
     }
 
-#ifdef IP_TOS
-#if HAVE_DECL_IPV6_TCLASS && ! defined HAVE_WINSOCK2_H
-    // IPV6_TCLASS is defined on Windows but not implemented.
-    if (isIPV6(inSettings)) {
-	const int dscp = inSettings->mTOS;
-	int rc = setsockopt(inSettings->mSock, IPPROTO_IPV6, IPV6_TCLASS, (char*) &dscp, sizeof(dscp));
-        WARN_errno(rc == SOCKET_ERROR, "setsockopt IPV6_TCLASS");
-    } else
-#endif
-    // set IP TOS (type-of-service) field
-    if (inSettings->mTOS > 0) {
-        int  tos = inSettings->mTOS;
-        Socklen_t len = sizeof(tos);
-        int rc = setsockopt(inSettings->mSock, IPPROTO_IP, IP_TOS,
-                             reinterpret_cast<char*>(&tos), len);
-        WARN_errno(rc == SOCKET_ERROR, "setsockopt IP_TOS");
-    }
+#if HAVE_DECL_IP_TOS
+    SetSocketOptionsIPTos(inSettings, inSettings->mTOS);
 #endif
 
     if (!isUDP(inSettings)) {
@@ -226,14 +211,29 @@ void SetSocketOptions (struct thread_Settings *inSettings) {
 	    setsock_tcp_mss(inSettings->mSock, inSettings->mMSS);
 	}
 #if HAVE_DECL_TCP_NODELAY
-        // set TCP nodelay option
-        if (isNoDelay(inSettings)) {
+	{
             int nodelay = 1;
             Socklen_t len = sizeof(nodelay);
-            int rc = setsockopt(inSettings->mSock, IPPROTO_TCP, TCP_NODELAY,
-                                 reinterpret_cast<char*>(&nodelay), len);
-            WARN_errno(rc == SOCKET_ERROR, "setsockopt TCP_NODELAY");
-        }
+	    int rc = 0;
+	    // set TCP nodelay option
+	    if (isNoDelay(inSettings)) {
+		rc = setsockopt(inSettings->mSock, IPPROTO_TCP, TCP_NODELAY,
+				reinterpret_cast<char*>(&nodelay), len);
+		WARN_errno(rc == SOCKET_ERROR, "setsockopt TCP_NODELAY");
+	    }
+	    // Read the socket setting, could be set on by kernel
+	    if (isEnhanced(inSettings) && (rc == 0)) {
+		rc = getsockopt(inSettings->mSock, IPPROTO_TCP, TCP_NODELAY,
+				reinterpret_cast<char*>(&nodelay), &len);
+		WARN_errno(rc == SOCKET_ERROR, "getsockopt TCP_NODELAY");
+		if (rc == 0) {
+		    if (nodelay)
+			setNoDelay(inSettings);
+		    else
+			unsetNoDelay(inSettings);
+		}
+	    }
+	}
 #endif
 #if HAVE_DECL_TCP_WINDOW_CLAMP
         // set TCP clamp option
@@ -246,7 +246,7 @@ void SetSocketOptions (struct thread_Settings *inSettings) {
         }
 #endif
 #if HAVE_DECL_TCP_NOTSENT_LOWAT
-        // set TCP clamp option
+        // set TCP not sent low watermark
         if (isWritePrefetch(inSettings)) {
             int bytecnt = inSettings->mWritePrefetch;
             Socklen_t len = sizeof(bytecnt);
@@ -307,4 +307,139 @@ void SetSocketOptionsReceiveTimeout (struct thread_Settings *mSettings, int time
     }
 //    fprintf(stderr,"**** rx timeout %d usecs\n", timer);
 }
+
+
+void SetSocketOptionsIPTos (struct thread_Settings *mSettings, int tos) {
+#if  HAVE_DECL_IP_TOS
+#ifdef HAVE_THREAD_DEBUG
+    thread_debug("Set socket IP_TOS to 0x%x", tos);
+#endif
+#if HAVE_DECL_IPV6_TCLASS && ! defined HAVE_WINSOCK2_H
+    // IPV6_TCLASS is defined on Windows but not implemented.
+    if (isIPV6(mSettings)) {
+	const int dscp = tos;
+	int rc = setsockopt(mSettings->mSock, IPPROTO_IPV6, IPV6_TCLASS, (char*) &dscp, sizeof(dscp));
+        WARN_errno(rc == SOCKET_ERROR, "setsockopt IPV6_TCLASS");
+    } else
+#endif
+	// set IP TOS (type-of-service) field
+	if (isOverrideTOS(mSettings) || (tos > 0)) {
+	    int reqtos = tos;
+	    Socklen_t len = sizeof(reqtos);
+	    int rc = setsockopt(mSettings->mSock, IPPROTO_IP, IP_TOS,
+				reinterpret_cast<char*>(&reqtos), len);
+	    WARN_errno(rc == SOCKET_ERROR, "setsockopt IP_TOS");
+	    rc = getsockopt(mSettings->mSock, IPPROTO_IP, IP_TOS,
+				reinterpret_cast<char*>(&reqtos), &len);
+	    WARN_errno(rc == SOCKET_ERROR, "getsockopt IP_TOS");
+	    WARN((reqtos != tos), "IP_TOS setting failed");
+	}
+#endif
+}
+
+
+/*
+ * Set a socket to blocking or non-blocking
+*
+ * Returns true on success, or false if there was an error
+*/
+bool setsock_blocking (int fd, bool blocking) {
+   if (fd < 0) return false;
+#ifdef WIN32
+   unsigned long mode = blocking ? 0 : 1;
+   return (ioctlsocket(fd, FIONBIO, &mode) == 0) ? true : false;
+#else
+   int flags = fcntl(fd, F_GETFL, 0);
+   if (flags < 0) return false;
+   flags = blocking ? (flags&~O_NONBLOCK) : (flags|O_NONBLOCK);
+   return (fcntl(fd, F_SETFL, flags) == 0) ? true : false;
+#endif
+}
+
+/* -------------------------------------------------------------------
+ * If inMSS > 0, set the TCP maximum segment size  for inSock.
+ * Otherwise leave it as the system default.
+ * ------------------------------------------------------------------- */
+
+const char warn_mss_fail[] = "\
+WARNING: attempt to set TCP maxmimum segment size to %d failed\n";
+
+void setsock_tcp_mss (int inSock, int inMSS) {
+#if HAVE_DECL_TCP_MAXSEG
+    int rc;
+    int newMSS;
+    Socklen_t len;
+
+    assert(inSock != INVALID_SOCKET);
+
+    if (inMSS > 0) {
+        /* set */
+        newMSS = inMSS;
+        len = sizeof(newMSS);
+        rc = setsockopt(inSock, IPPROTO_TCP, TCP_MAXSEG, (char*) &newMSS,  len);
+        if (rc == SOCKET_ERROR) {
+            fprintf(stderr, warn_mss_fail, newMSS);
+            return;
+        }
+    }
+#endif
+} /* end setsock_tcp_mss */
+
+/* -------------------------------------------------------------------
+ * returns the TCP maximum segment size
+ * ------------------------------------------------------------------- */
+
+int getsock_tcp_mss  (int inSock) {
+    int theMSS = -1;
+#if HAVE_DECL_TCP_MAXSEG
+    int rc;
+    Socklen_t len;
+    assert(inSock >= 0);
+
+    /* query for MSS */
+    len = sizeof(theMSS);
+    rc = getsockopt(inSock, IPPROTO_TCP, TCP_MAXSEG, (char*)&theMSS, &len);
+    WARN_errno(rc == SOCKET_ERROR, "getsockopt TCP_MAXSEG");
+#endif
+    return theMSS;
+} /* end getsock_tcp_mss */
+
+#ifdef DEFAULT_PAYLOAD_LEN_PER_MTU_DISCOVERY
+#define UDPMAXSIZE ((1024 * 64) - 64) // 16 bit field for UDP
+void checksock_max_udp_payload (struct thread_Settings *inSettings) {
+#if HAVE_DECL_SIOCGIFMTU
+    struct ifreq ifr;
+    if (!isBuflenSet(inSettings) && inSettings->mIfrname) {
+	strncpy(ifr.ifr_name, inSettings->mIfrname, (size_t) (IFNAMSIZ - 1));
+	if (!ioctl(inSettings->mSock, SIOCGIFMTU, &ifr)) {
+	    int max;
+	    if (!isIPV6(inSettings)) {
+		max = ifr.ifr_mtu - IPV4HDRLEN - UDPHDRLEN;
+	    } else {
+		max = ifr.ifr_mtu - IPV6HDRLEN - UDPHDRLEN;
+	    }
+	    if ((max > 0) && (max != inSettings->mBufLen)) {
+		if (max > UDPMAXSIZE) {
+		    max = UDPMAXSIZE;
+		}
+		if (max > inSettings->mBufLen) {
+		    char *tmp = new char[max];
+		    assert(tmp!=NULL);
+		    if (tmp) {
+			pattern(tmp, max);
+			memcpy(tmp, inSettings->mBuf, inSettings->mBufLen);
+			DELETE_ARRAY(inSettings->mBuf);
+			inSettings->mBuf = tmp;
+			inSettings->mBufLen = max;
+		    }
+		} else {
+		    inSettings->mBufLen = max;
+		}
+	    }
+	}
+    }
+#endif
+}
+#endif
+
 // end SetSocketOptions

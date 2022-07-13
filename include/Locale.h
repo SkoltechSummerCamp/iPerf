@@ -138,6 +138,10 @@ extern const char client_isochronous[];
 
 extern const char client_burstperiod[];
 
+extern const char client_bounceback[];
+
+extern const char client_bounceback_noqack[];
+
 extern const char server_burstperiod[];
 
 extern const char client_fq_pacing[];
@@ -207,13 +211,23 @@ extern const char report_triptime_enhanced_format[];
 
 extern const char report_bw_write_enhanced_header[];
 
-extern const char report_sumcnt_bw_write_enhanced_header[];
+extern const char report_bw_write_enhanced_header[];
+
+extern const char report_sumcnt_write_enhanced_write_header[];
 
 extern const char report_bw_write_enhanced_format[];
+
+extern const char report_write_enhanced_write_header[];
+
+extern const char report_write_enhanced_write_format[];
+
+extern const char report_write_enhanced_nocwnd_write_format[];
 
 extern const char report_bw_write_enhanced_nocwnd_format[];
 
 extern const char report_sum_bw_write_enhanced_format[];
+
+extern const char report_sumcnt_bw_write_enhanced_header[];
 
 extern const char report_sumcnt_bw_write_enhanced_format[];
 
@@ -271,6 +285,14 @@ extern const char report_burst_read_tcp_format[];
 
 extern const char report_burst_read_tcp_final_format[];
 
+extern const char report_burst_write_tcp_header[];
+
+extern const char report_burst_write_tcp_format[];
+
+extern const char report_burst_write_tcp_nocwnd_format[];
+
+extern const char report_burst_write_tcp_final_format[];
+
 extern const char report_udp_fullduplex_header[];
 
 extern const char report_udp_fullduplex_format[];
@@ -282,6 +304,12 @@ extern const char report_udp_fullduplex_enhanced_format[];
 extern const char report_sumcnt_udp_fullduplex_header[];
 
 extern const char report_sumcnt_udp_fullduplex_format[];
+
+extern const char report_client_bb_bw_header[];
+
+extern const char report_client_bb_bw_format[];
+
+extern const char report_client_bb_bw_triptime_format[];
 
 /* -------------------------------------------------------------------
  * Misc reports
@@ -304,6 +332,8 @@ extern const char report_peer_fail[];
 extern const char report_mss_unsupported[];
 
 extern const char report_mss[];
+
+extern const char report_default_mss[];
 
 extern const char report_datagrams[];
 

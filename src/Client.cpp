@@ -66,6 +66,7 @@
 #include "version.h"
 #include "payloads.h"
 #include "active_hosts.h"
+#include "gettcpinfo.h"
 
 // const double kSecs_to_usecs = 1e6;
 const double kSecs_to_nsecs = 1e9;
@@ -76,7 +77,7 @@ const int    kBytes_to_Bits = 8;
 
 Client::Client (thread_Settings *inSettings) {
 #ifdef HAVE_THREAD_DEBUG
-  thread_debug("Client constructor with thread %p sum=%p (flags=%x)", (void *) inSettings, (void *)inSettings->mSumReport, inSettings->flags);
+    thread_debug("Client constructor with thread %p sum=%p (flags=%x)", (void *) inSettings, (void *)inSettings->mSumReport, inSettings->flags);
 #endif
     mSettings = inSettings;
     myJob = NULL;
@@ -96,7 +97,6 @@ Client::Client (thread_Settings *inSettings) {
 	unsetPeerVerDetect(mSettings);
     }
 
-    pattern(mSettings->mBuf, mSettings->mBufLen);
     if (isFileInput(mSettings)) {
         if (!isSTDIN(mSettings))
             Extractor_Initialize(mSettings->mFileName, mSettings->mBufLen, mSettings);
@@ -134,11 +134,10 @@ Client::~Client () {
  * ------------------------------------------------------------------- */
 bool Client::my_connect (bool close_on_fail) {
     int rc;
-    double connecttime = -1.0;
     // create an internet socket
     int type = (isUDP(mSettings) ? SOCK_DGRAM : SOCK_STREAM);
     int domain = (SockAddr_isIPv6(&mSettings->peer) ?
-#ifdef HAVE_IPV6
+#if HAVE_IPV6
                   AF_INET6
 #else
                   AF_INET
@@ -159,8 +158,16 @@ bool Client::my_connect (bool close_on_fail) {
         WARN_errno(rc == SOCKET_ERROR, "bind");
     }
 
+    if (!isUDP(mSettings) && isReport(mSettings) && isSettingsReport(mSettings)) {
+	struct ReportHeader *tmp = InitSettingsReport(mSettings);
+	assert(tmp!=NULL);
+	PostReport(tmp);
+	setNoSettReport(mSettings);
+    }
+
     // connect socket
     connected = false;
+    mSettings->tcpinitstats.connecttime = -1;
     if (!isUDP(mSettings)) {
 	int trycnt = mSettings->mConnectRetries + 1;
 	while (trycnt > 0) {
@@ -179,8 +186,7 @@ bool Client::my_connect (bool close_on_fail) {
 		}
 	    } else {
 		connect_done.setnow();
-		connecttime = 1e3 * connect_done.subSec(connect_start);
-		mSettings->connecttime = connecttime;
+		mSettings->tcpinitstats.connecttime = 1e3 * connect_done.subSec(connect_start);
 		connected = true;
 		break;
 	    }
@@ -188,46 +194,56 @@ bool Client::my_connect (bool close_on_fail) {
     } else {
 	rc = connect(mySocket, reinterpret_cast<sockaddr*>(&mSettings->peer),
 		     SockAddr_get_sizeof_sockaddr(&mSettings->peer));
-	connecttime = 0.0; // UDP doesn't have a 3WHS
+	mSettings->tcpinitstats.connecttime = 0.0; // UDP doesn't have a 3WHS
         WARN_errno((rc == SOCKET_ERROR), "udp connect");
 	if (rc != SOCKET_ERROR)
 	    connected = true;
     }
     if (connected) {
+#if HAVE_TCP_STATS
+        assert(reportstruct);
+	if (!isUDP(mSettings)) {
+	    gettcpinfo(mySocket, &mSettings->tcpinitstats);
+	}
+#endif
 	// Set the send timeout for the very first write which has the test exchange
 	int sosndtimer = TESTEXCHANGETIMEOUT; // 4 sec in usecs
 	SetSocketOptionsSendTimeout(mSettings, sosndtimer);
 	getsockname(mySocket, reinterpret_cast<sockaddr*>(&mSettings->local), &mSettings->size_local);
 	getpeername(mySocket, reinterpret_cast<sockaddr*>(&mSettings->peer), &mSettings->size_peer);
 	SockAddr_Ifrname(mSettings);
+#ifdef DEFAULT_PAYLOAD_LEN_PER_MTU_DISCOVERY
+	if (isUDP(mSettings) && !isBuflenSet(mSettings)) {
+	    checksock_max_udp_payload(mSettings);
+	}
+#endif
 	if (isUDP(mSettings) && !isIsochronous(mSettings) && !isIPG(mSettings)) {
 	    mSettings->mBurstIPG = get_delay_target() / 1e3; // this is being set for the settings report only
 	}
+	if (isReport(mSettings) && isSettingsReport(mSettings)) {
+	    struct ReportHeader *tmp = InitSettingsReport(mSettings);
+	    assert(tmp!=NULL);
+	    PostReport(tmp);
+	    setNoSettReport(mSettings);
+	}
     } else {
-	connecttime = -1;
 	if (mySocket != INVALID_SOCKET) {
 	    int rc = close(mySocket);
 	    WARN_errno(rc == SOCKET_ERROR, "client connect close");
 	    mySocket = INVALID_SOCKET;
 	}
     }
-    if (isReport(mSettings) && isSettingsReport(mSettings)) {
-	struct ReportHeader *tmp = InitSettingsReport(mSettings);
-	assert(tmp!=NULL);
-	PostReport(tmp);
-	setNoSettReport(mSettings);
-    }
     // Post the connect report unless peer version exchange is set
     if (isConnectionReport(mSettings) && !isSumOnly(mSettings)) {
 	if (connected) {
-	    struct ReportHeader *reporthdr = InitConnectionReport(mSettings, connecttime);
+	    struct ReportHeader *reporthdr = InitConnectionReport(mSettings);
 	    struct ConnectionInfo *cr = static_cast<struct ConnectionInfo *>(reporthdr->this_report);
 	    cr->connect_timestamp.tv_sec = connect_start.getSecs();
 	    cr->connect_timestamp.tv_usec = connect_start.getUsecs();
 	    assert(reporthdr);
 	    PostReport(reporthdr);
 	} else {
-	    PostReport(InitConnectionReport(mSettings, -1));
+	    PostReport(InitConnectionReport(mSettings));
 	}
     }
     return connected;
@@ -246,28 +262,10 @@ void Client::TxDelay () {
     }
 }
 
-// return true of tcpi stats were sampled
-#ifdef HAVE_STRUCT_TCP_INFO_TCPI_TOTAL_RETRANS
-inline bool Client::myReportPacket (bool sample_tcpi) {
-    bool rc = false;
-    if (sample_tcpi) {
-	rc = ReportPacket(myReport, reportstruct, &my_tcpi_stats);
-    } else {
-	ReportPacket(myReport, reportstruct, NULL);
-    }
-    reportstruct->packetLen = 0;
-    return rc;
-}
-inline void Client::myReportPacket () {
-    ReportPacket(myReport, reportstruct, NULL);
-    reportstruct->packetLen = 0;
-}
-#else
 inline void Client::myReportPacket (void) {
     ReportPacket(myReport, reportstruct);
     reportstruct->packetLen = 0;
 }
-#endif
 
 
 // There are multiple startup synchronizations, this code
@@ -281,6 +279,7 @@ int Client::StartSynch () {
     myJob = InitIndividualReport(mSettings);
     myReport = static_cast<struct ReporterData *>(myJob->this_report);
     myReport->info.common->socket=mySocket;
+    myReport->info.isEnableTcpInfo = false; // default here, set in init traffic actions
 
     // Perform delays, usually between connect() and data xfer though before connect
     // Two delays are supported:
@@ -289,7 +288,7 @@ int Client::StartSynch () {
     // check for an epoch based start time
     reportstruct->packetLen = 0;
     if (!isServerReverse(mSettings)) {
-	if (!isCompat(mSettings)) {
+	if (!isCompat(mSettings) && !isBounceBack(mSettings)) {
 	    reportstruct->packetLen = SendFirstPayload();
 	    // Reverse UDP tests need to retry "first sends" a few times
 	    // before going to server or read mode
@@ -333,11 +332,28 @@ int Client::StartSynch () {
 	    return -1;
     }
     SetReportStartTime();
+#if HAVE_TCP_STATS
+    if (!isUDP(mSettings)) {
+	// Near congestion and peridiodic need sampling on every report packet
+	if (isNearCongest(mSettings) || isPeriodicBurst(mSettings)) {
+	    myReport->info.isEnableTcpInfo = true;
+	    myReport->info.ts.nextTCPSampleTime.tv_sec = 0;
+	    myReport->info.ts.nextTCPSampleTime.tv_usec = 0;
+	} else if (isEnhanced(mSettings) || isBounceBack(mSettings)) {
+	    myReport->info.isEnableTcpInfo = true;
+	    myReport->info.ts.nextTCPSampleTime = myReport->info.ts.nextTime;
+	}
+    }
+#endif
+
     if (reportstruct->packetLen > 0) {
 	reportstruct->packetTime = myReport->info.ts.startTime;
 	reportstruct->sentTime = reportstruct->packetTime;
 	reportstruct->prevSentTime = reportstruct->packetTime;
 	reportstruct->prevPacketTime = myReport->info.ts.prevpacketTime;
+	if (isModeAmount(mSettings)) {
+	    mSettings->mAmount -= reportstruct->packetLen;
+	}
 	myReportPacket();
 	myReport->info.ts.prevpacketTime = reportstruct->packetTime;
 	reportstruct->packetID++;
@@ -376,9 +392,6 @@ inline void Client::SetReportStartTime () {
     if (!TimeZero(myReport->info.ts.intervalTime)) {
 	myReport->info.ts.nextTime = myReport->info.ts.startTime;
 	TimeAdd(myReport->info.ts.nextTime, myReport->info.ts.intervalTime);
-#ifdef HAVE_STRUCT_TCP_INFO_TCPI_TOTAL_RETRANS
-	myReport->info.ts.nextTCPStampleTime = myReport->info.ts.nextTime;
-#endif
     }
     if (myReport->GroupSumReport) {
 	struct TransferInfo *sumstats = &myReport->GroupSumReport->info;
@@ -456,9 +469,9 @@ void Client::InitTrafficLoop () {
     if (isPeriodicBurst(mSettings) && (mSettings->mFPS > 0.0)) {
 	sosndtimer = static_cast<int>(round(250000.0 / mSettings->mFPS));
     } else if (mSettings->mInterval > 0) {
-	sosndtimer = static_cast<int>(mSettings->mInterval / 2);
+        sosndtimer = static_cast<int>(round(0.5 * mSettings->mInterval));
     } else {
-	sosndtimer = static_cast<int>((mSettings->mAmount * 10000) / 2);
+	sosndtimer = static_cast<int>(mSettings->mAmount * 5e3);
     }
     SetSocketOptionsSendTimeout(mSettings, sosndtimer);
     // set the lower bounds delay based of the socket timeout timer
@@ -473,6 +486,7 @@ void Client::InitTrafficLoop () {
     if (isModeTime(mSettings)) {
         mEndTime.setnow();
         mEndTime.add(mSettings->mAmount / 100.0);
+	// now.setnow(); fprintf(stderr, "DEBUG: end time set to %ld.%ld now is %ld.%ld\n", mEndTime.getSecs(), mEndTime.getUsecs(), now.getSecs(), now.getUsecs());
     }
     readAt = mSettings->mBuf;
     lastPacketTime.set(myReport->info.ts.startTime.tv_sec, myReport->info.ts.startTime.tv_usec);
@@ -523,7 +537,9 @@ void Client::Run () {
 	}
     } else {
 	// Launch the approprate TCP traffic loop
-	if (mSettings->mAppRate > 0) {
+	if (isBounceBack(mSettings)) {
+	    RunBounceBackTCP();
+	} else if (mSettings->mAppRate > 0) {
 	    RunRateLimitedTCP();
 	} else if (isNearCongest(mSettings)) {
 	    RunNearCongestionTCP();
@@ -545,10 +561,13 @@ void Client::RunTCP () {
     int burst_remaining = 0;
     int burst_id = 1;
     int writelen = mSettings->mBufLen;
+
     now.setnow();
     reportstruct->packetTime.tv_sec = now.getSecs();
     reportstruct->packetTime.tv_usec = now.getUsecs();
+    reportstruct->write_time = 0;
     while (InProgress()) {
+	reportstruct->writecnt = 0;
         if (isModeAmount(mSettings)) {
 	    writelen = ((mSettings->mAmount < static_cast<unsigned>(mSettings->mBufLen)) ? mSettings->mAmount : mSettings->mBufLen);
 	}
@@ -571,6 +590,7 @@ void Client::RunTCP () {
 		if (isPeriodicBurst(mSettings)) {
 		    // low duty cycle traffic needs special event handling
 		    now.setnow();
+		    myReport->info.ts.prevsendTime = reportstruct->packetTime;
 		    reportstruct->packetTime.tv_sec = now.getSecs();
 		    reportstruct->packetTime.tv_usec = now.getUsecs();
 		    if (!InProgress()) {
@@ -598,13 +618,16 @@ void Client::RunTCP () {
 	    myReport->info.ts.prevsendTime = reportstruct->packetTime;
 	    writelen = (mSettings->mBufLen > burst_remaining) ? burst_remaining : mSettings->mBufLen;
 	    // perform write, full header must succeed
-	    reportstruct->packetLen = writen(mySocket, mSettings->mBuf, writelen);
+	    reportstruct->packetLen = writen(mySocket, mSettings->mBuf, writelen, &reportstruct->writecnt);
 	    FAIL_errno(reportstruct->packetLen < (intmax_t) sizeof(struct TCP_burst_payload), "burst written", mSettings);
 	} else {
 	    // printf("pl=%ld\n",reportstruct->packetLen);
 	    // perform write
 	    if (isburst)
 		writelen = (mSettings->mBufLen > burst_remaining) ? burst_remaining : mSettings->mBufLen;
+	    if (isTcpWriteTimes(mSettings)) {
+		write_start.setnow();
+	    }
 #if HAVE_DECL_TCP_NOTSENT_LOWAT
 	    if (isWritePrefetch(mSettings)) {
 		AwaitWriteSelectEventTCP();
@@ -612,8 +635,12 @@ void Client::RunTCP () {
 #endif
 	    reportstruct->packetLen = write(mySocket, mSettings->mBuf, writelen);
 	    now.setnow();
+	    reportstruct->writecnt++;
 	    reportstruct->packetTime.tv_sec = now.getSecs();
 	    reportstruct->packetTime.tv_usec = now.getUsecs();
+	    if (isTcpWriteTimes(mSettings)) {
+		reportstruct->write_time = now.subUsec(write_start);
+	    }
 	    reportstruct->sentTime = reportstruct->packetTime;
 	}
 	if (reportstruct->packetLen <= 0) {
@@ -640,6 +667,7 @@ void Client::RunTCP () {
 		    reportstruct->transit_ready = 0;
 		} else {
 		    reportstruct->transit_ready = 1;
+		    reportstruct->prevSentTime = myReport->info.ts.prevsendTime;
 		}
 	    }
 	}
@@ -668,6 +696,7 @@ void Client::RunNearCongestionTCP () {
     reportstruct->packetTime.tv_sec = now.getSecs();
     reportstruct->packetTime.tv_usec = now.getUsecs();
     while (InProgress()) {
+	reportstruct->writecnt = 0;
         if (isModeAmount(mSettings)) {
 	    reportstruct->packetLen = ((mSettings->mAmount < static_cast<unsigned>(mSettings->mBufLen)) ? mSettings->mAmount : mSettings->mBufLen);
 	} else {
@@ -685,6 +714,7 @@ void Client::RunNearCongestionTCP () {
 	    // perform write
 	    int writelen = (mSettings->mBufLen > burst_remaining) ? burst_remaining : mSettings->mBufLen;
 	    reportstruct->packetLen = write(mySocket, mSettings->mBuf, writelen);
+	    reportstruct->writecnt++;
 	    assert(reportstruct->packetLen >= (intmax_t) sizeof(struct TCP_burst_payload));
 	    goto ReportNow;
 	}
@@ -695,6 +725,7 @@ void Client::RunNearCongestionTCP () {
 	// perform write
 	reportstruct->packetLen = write(mySocket, mSettings->mBuf, reportstruct->packetLen);
 	now.setnow();
+	reportstruct->writecnt++;
 	reportstruct->packetTime.tv_sec = now.getSecs();
 	reportstruct->packetTime.tv_usec = now.getUsecs();
 	reportstruct->sentTime = reportstruct->packetTime;
@@ -729,17 +760,19 @@ void Client::RunNearCongestionTCP () {
 		mSettings->mAmount = 0;
 	    }
 	}
-#ifdef HAVE_STRUCT_TCP_INFO_TCPI_TOTAL_RETRANS
 	// apply placing after write burst completes
-	if (reportstruct->transit_ready && myReportPacket(true)) {
-	    int pacing_timer = static_cast<int>(std::ceil(static_cast<double>(my_tcpi_stats.tcpi_rtt) * mSettings->rtt_nearcongest_divider));
-//		printf("**** delaytime = %d\n", delaytime);
-	    delay_loop(pacing_timer);
-	} else
+	if (reportstruct->transit_ready) {
+	    myReportPacket(); // this will set the tcpstats in the report struct
+	    // pacing timer is weighted by the RTT (set to 1 when RTT is not supported)
+	    int pacing_timer = 0;
+#if HAVE_TCP_STATS
+	    pacing_timer = static_cast<int>(std::ceil(static_cast<double>(reportstruct->tcpstats.rtt) * mSettings->rtt_nearcongest_weight_factor));
+#else
+	    pacing_timer = static_cast<int>(100 * mSettings->rtt_nearcongest_weight_factor);
 #endif
-        {
-	   myReportPacket();
-        }
+	    if (pacing_timer)
+		delay_loop(pacing_timer);
+	}
     }
     FinishTrafficActions();
 }
@@ -761,6 +794,7 @@ void Client::RunRateLimitedTCP () {
     reportstruct->packetTime.tv_sec = now.getSecs();
     reportstruct->packetTime.tv_usec = now.getUsecs();
     while (InProgress() && !fatalwrite_err) {
+	reportstruct->writecnt = 0;
 	// Add tokens per the loop time
 	time2.setnow();
         if (isVaryLoad(mSettings)) {
@@ -791,7 +825,7 @@ void Client::RunRateLimitedTCP () {
 		    reportstruct->sentTime = reportstruct->packetTime;
 		    burst_remaining = burst_size;
 		    // perform write
-		    n = writen(mySocket, mSettings->mBuf, sizeof(struct TCP_burst_payload));
+		    n = writen(mySocket, mSettings->mBuf, sizeof(struct TCP_burst_payload), &reportstruct->writecnt);
 		    WARN(n != sizeof(struct TCP_burst_payload), "burst hdr write failed");
 		    burst_remaining -= n;
 		    reportstruct->packetLen -= n;
@@ -801,6 +835,7 @@ void Client::RunRateLimitedTCP () {
 		}
 	    }
 	    int len = write(mySocket, mSettings->mBuf, reportstruct->packetLen);
+	    reportstruct->writecnt++;
 	    if (len < 0) {
 	        if (NONFATALTCPWRITERR(errno)) {
 		    reportstruct->errwrite=WriteErrAccount;
@@ -867,9 +902,7 @@ inline bool Client::AwaitWriteSelectEventTCP (void) {
 	timeout.tv_usec = 0;
     }
 
-    Timestamp t1;
     if ((rc = select(mySocket + 1, NULL, &writeset, NULL, &timeout)) <= 0) {
-        reportstruct->select_delay = -1;
 	WARN_errno((rc < 0), "select");
 #ifdef HAVE_THREAD_DEBUG
 	if (rc == 0)
@@ -877,9 +910,6 @@ inline bool Client::AwaitWriteSelectEventTCP (void) {
 #endif
 	return false;
     }
-    Timestamp t2;
-    reportstruct->select_delay = t2.subSec(t1);
-    //    printf("*****t1 = %f\n", t2.subSec(t1));
     return true;
 }
 
@@ -895,6 +925,10 @@ void Client::RunWriteEventsTCP () {
 	    writelen = ((mSettings->mAmount < static_cast<unsigned>(mSettings->mBufLen)) ? mSettings->mAmount : mSettings->mBufLen);
 	}
 	now.setnow();
+	reportstruct->write_time = 0;
+	if (isTcpWriteTimes(mSettings)) {
+	    write_start = now;
+	}
 	bool rc = AwaitWriteSelectEventTCP();
 	reportstruct->emptyreport = (rc == false) ? 1 : 0;
         if (rc) {
@@ -903,7 +937,7 @@ void Client::RunWriteEventsTCP () {
 	    reportstruct->packetTime.tv_usec = now.getUsecs();
 	    WriteTcpTxHdr(reportstruct, writelen, ++burst_id);
 	    reportstruct->sentTime = reportstruct->packetTime;
-	    reportstruct->packetLen = writen(mySocket, mSettings->mBuf, writelen);
+	    reportstruct->packetLen = writen(mySocket, mSettings->mBuf, writelen, &reportstruct->writecnt);
 	    if (reportstruct->packetLen <= 0) {
 		WARN_errno((reportstruct->packetLen < 0), "event writen()");
 		if (reportstruct->packetLen == 0) {
@@ -911,6 +945,9 @@ void Client::RunWriteEventsTCP () {
 		}
 		reportstruct->packetLen = 0;
 		reportstruct->emptyreport = 1;
+	    } else if (isTcpWriteTimes(mSettings)) {
+		Timestamp write_end;
+		reportstruct->write_time = write_end.subUsec(write_start);
 	    }
 	}
 	if (isModeAmount(mSettings) && !reportstruct->emptyreport) {
@@ -928,6 +965,84 @@ void Client::RunWriteEventsTCP () {
     FinishTrafficActions();
 }
 #endif
+void Client::RunBounceBackTCP () {
+    int burst_id = 0;
+    int writelen = mSettings->mBufLen;
+    memset(mSettings->mBuf, 0x5A, sizeof(struct bounceback_hdr));
+    if (mSettings->mInterval && (mSettings->mIntervalMode == kInterval_Time)) {
+	int sotimer = static_cast<int>(round(mSettings->mInterval / 2.0));
+	SetSocketOptionsReceiveTimeout(mSettings, sotimer);
+	SetSocketOptionsSendTimeout(mSettings, sotimer);
+    } else if (isModeTime(mSettings)) {
+	int sotimer = static_cast<int>(round(mSettings->mAmount * 10000) / 2);
+	SetSocketOptionsReceiveTimeout(mSettings, sotimer);
+	SetSocketOptionsSendTimeout(mSettings, sotimer);
+    }
+    if (isModeTime(mSettings)) {
+	int end_usecs  (mSettings->mAmount * 10000); //amount units is 10 ms
+	if (int err = set_itimer(end_usecs)) {
+	    FAIL_errno(err != 0, "setitimer", mSettings);
+	}
+    }
+    now.setnow();
+    reportstruct->packetTime.tv_sec = now.getSecs();
+    reportstruct->packetTime.tv_usec = now.getUsecs();
+    while (InProgress()) {
+	int n;
+	reportstruct->writecnt = 0;
+	if (framecounter) {
+	    burst_id = framecounter->wait_tick();
+	} else {
+	    burst_id++;
+	}
+	now.setnow();
+	reportstruct->sentTime.tv_sec = now.getSecs();
+	reportstruct->sentTime.tv_usec = now.getUsecs();
+	WriteTcpTxBBHdr(reportstruct, burst_id);
+	myReport->info.ts.prevsendTime = reportstruct->sentTime;
+	reportstruct->packetLen = writen(mySocket, mSettings->mBuf, writelen, &reportstruct->writecnt);
+	if (reportstruct->packetLen == writelen) {
+	    reportstruct->emptyreport = 0;
+	    totLen += reportstruct->packetLen;
+	    reportstruct->errwrite=WriteNoErr;
+#if HAVE_DECL_TCP_QUICKACK
+	    if (isTcpQuickAck(mSettings)) {
+		int opt = 1;
+		Socklen_t len = sizeof(opt);
+		int rc = setsockopt(mySocket, IPPROTO_TCP, TCP_QUICKACK,
+				    reinterpret_cast<char*>(&opt), len);
+		WARN_errno(rc == SOCKET_ERROR, "setsockopt TCP_QUICKACK");
+	    }
+#endif
+	    if ((n = recvn(mySocket, mSettings->mBuf, mSettings->mBounceBackBytes, 0)) == mSettings->mBounceBackBytes) {
+		struct bounceback_hdr *bbhdr = reinterpret_cast<struct bounceback_hdr *>(mSettings->mBuf);
+		now.setnow();
+		reportstruct->sentTimeRX.tv_sec = ntohl(bbhdr->bbserverRx_ts.sec);
+		reportstruct->sentTimeRX.tv_usec = ntohl(bbhdr->bbserverRx_ts.usec);
+		reportstruct->sentTimeTX.tv_sec = ntohl(bbhdr->bbserverTx_ts.sec);
+		reportstruct->sentTimeTX.tv_usec = ntohl(bbhdr->bbserverTx_ts.usec);
+		reportstruct->packetTime.tv_sec = now.getSecs();
+		reportstruct->packetTime.tv_usec = now.getUsecs();
+		reportstruct->packetLen += n;
+		reportstruct->emptyreport = 0;
+		myReportPacket();
+	    } else if (n == 0) {
+		peerclose = true;
+	    }
+	} else if ((reportstruct->packetLen < 0 ) && NONFATALTCPWRITERR(errno)) {
+	    reportstruct->packetLen = 0;
+	    reportstruct->emptyreport = 1;
+	    reportstruct->errwrite=WriteErrNoAccount;
+	    myReportPacket();
+	} else {
+	    reportstruct->errwrite=WriteErrFatal;
+	    reportstruct->packetLen = -1;
+	    FAIL_errno(1, "tcp bounce-back write", mSettings);
+	}
+    }
+    disarm_itimer();
+    FinishTrafficActions();
+}
 /*
  * UDP send loop
  */
@@ -974,6 +1089,7 @@ void Client::RunUDP () {
         //  default: break;
         //}
 	now.setnow();
+	reportstruct->writecnt = 1;
 	reportstruct->packetTime.tv_sec = now.getSecs();
 	reportstruct->packetTime.tv_usec = now.getUsecs();
 	reportstruct->sentTime = reportstruct->packetTime;
@@ -1272,16 +1388,58 @@ inline void Client::WriteTcpTxHdr (struct ReportStruct *reportstruct, int burst_
 //    printf("**** Write tcp burst header size= %d id = %d\n", burst_size, burst_id);
 }
 
-inline bool Client::InProgress () {
+// See payloads.h
+void Client::WriteTcpTxBBHdr (struct ReportStruct *reportstruct, int bbid) {
+    struct bounceback_hdr * mBuf_bb = reinterpret_cast<struct bounceback_hdr *>(mSettings->mBuf);
+    // store packet ID into buffer
+    uint32_t flags = HEADER_BOUNCEBACK;
+    uint32_t bbflags = 0x0;
+    mBuf_bb->flags = htonl(flags);
+    if (isTripTime(mSettings)) {
+	bbflags |= HEADER_BBCLOCKSYNCED;
+    }
+    if (mSettings->mTOS) {
+	bbflags |= HEADER_BBTOS;
+	mBuf_bb->tos = htons((mSettings->mTOS & 0xFF));
+    }
+    if (isTcpQuickAck(mSettings)) {
+	bbflags |= HEADER_BBQUICKACK;
+    }
+    mBuf_bb->bbflags = htons(bbflags);
+    mBuf_bb->bbsize = htonl(mSettings->mBufLen);
+    mBuf_bb->bbid = htonl(bbid);
+    mBuf_bb->bbclientTx_ts.sec = htonl(reportstruct->packetTime.tv_sec);
+    mBuf_bb->bbclientTx_ts.usec = htonl(reportstruct->packetTime.tv_usec);
+    mBuf_bb->bbserverRx_ts.sec = -1;
+    mBuf_bb->bbserverRx_ts.usec = -1;
+    mBuf_bb->bbserverTx_ts.sec = -1;
+    mBuf_bb->bbserverTx_ts.usec = -1;
+    mBuf_bb->bbhold = htonl(mSettings->mBounceBackHold);
+}
+
+inline bool Client::InProgress (void) {
     // Read the next data block from
     // the file if it's file input
     if (isFileInput(mSettings)) {
 	Extractor_getNextDataBlock(readAt, mSettings);
         return Extractor_canRead(mSettings) != 0;
     }
+    // fprintf(stderr, "DEBUG: SI=%d PC=%d T=%d A=%d\n", sInterupted, peerclose, (isModeTime(mSettings) && mEndTime.before(reportstruct->packetTime)), (isModeAmount(mSettings) && (mSettings->mAmount <= 0)));
     return !(sInterupted || peerclose || \
 	(isModeTime(mSettings) && mEndTime.before(reportstruct->packetTime))  ||
 	(isModeAmount(mSettings) && (mSettings->mAmount <= 0)));
+}
+
+inline void Client::tcp_shutdown (void) {
+    if ((mySocket != INVALID_SOCKET) && isConnected()) {
+	int rc = shutdown(mySocket, SHUT_WR);
+#ifdef HAVE_THREAD_DEBUG
+	thread_debug("Client calls shutdown() SHUTW_WR on tcp socket %d", mySocket);
+#endif
+	WARN_errno(rc == SOCKET_ERROR, "shutdown");
+	if (!rc && !isFullDuplex(mSettings))
+	    AwaitServerCloseEvent();
+    }
 }
 
 /*
@@ -1300,18 +1458,7 @@ void Client::FinishTrafficActions () {
     disarm_itimer();
     // Shutdown the TCP socket's writes as the event for the server to end its traffic loop
     if (!isUDP(mSettings)) {
-	if ((mySocket != INVALID_SOCKET) && isConnected()) {
-#ifdef HAVE_STRUCT_TCP_INFO_TCPI_TOTAL_RETRANS
-	  // gettcpistats(myReport, true, NULL);
-#endif
-	    int rc = shutdown(mySocket, SHUT_WR);
-#ifdef HAVE_THREAD_DEBUG
-	    thread_debug("Client calls shutdown() SHUTW_WR on tcp socket %d", mySocket);
-#endif
-	    WARN_errno(rc == SOCKET_ERROR, "shutdown");
-	    if (!rc && !isFullDuplex(mSettings))
-		AwaitServerCloseEvent();
-	}
+	tcp_shutdown();
 	now.setnow();
 	reportstruct->packetTime.tv_sec = now.getSecs();
 	reportstruct->packetTime.tv_usec = now.getUsecs();
@@ -1462,10 +1609,13 @@ void Client::AwaitServerCloseEvent () {
     while ((rc = recv(mySocket, mSettings->mBuf, mSettings->mBufLen, 0) > 0)) {};
     if (rc < 0)
 	WARN_errno(1, "client await server close");
+
+    if (rc==0) {
+	connected = false;
 #ifdef HAVE_THREAD_DEBUG
-    if (rc==0)
 	thread_debug("Client detected server close %d", mySocket);
 #endif
+    }
 }
 
 int Client::SendFirstPayload () {
@@ -1478,6 +1628,7 @@ int Client::SendFirstPayload () {
 	    reportstruct->packetTime.tv_sec = now.getSecs();
 	    reportstruct->packetTime.tv_usec = now.getUsecs();
 	}
+	pattern(mSettings->mBuf, mSettings->mBufLen);
 	if (isTxStartTime(mSettings)) {
 	    pktlen = Settings_GenerateClientHdr(mSettings, (void *) mSettings->mBuf, mSettings->txstart_epoch);
 	} else {
@@ -1553,7 +1704,7 @@ void Client::PeerXchange () {
 		double atr = (now.get() - acktx.get()) * 1e3;
 		double rtt = str + atr;
 		double halfrtt = rtt / 2.0;
-		fprintf(stderr,"%sClock sync check (ms): RTT/Half=(%0.3f/%0.3f) OWD-send/ack/asym=(%0.3f/%0.3f/%0.3f)\n",mSettings->mTransferIDStr, rtt, halfrtt, str, atr, abs(str-atr));
+		fprintf(stderr,"%sClock sync check (ms): RTT/Half=(%0.3f/%0.3f) OWD-send/ack/asym=(%0.3f/%0.3f/%0.3f)\n",mSettings->mTransferIDStr, rtt, halfrtt, str, atr, (str-atr));
 	    }
 	}
     } else {

@@ -6,8 +6,12 @@ lo=localhost
 ip=127.0.0.1
 ip6=::1
 
-port=$(expr 5000 + $0 : '.*/t\([0-9]*\)_')
-lport=$(expr 6000 - $0 : '.*/t\([0-9]*\)_')
+# Some versions of expr can't handle can't mix regexp and math
+test=$(expr $0 : '.*/t\([0-9]*\)_')
+port=$(expr 5000 + $test)
+lport=$(expr 6000 - $test)
+
+@() { echo "+ $@"; "$@"; }
 
 run_iperf() {
     mode=server
@@ -30,9 +34,9 @@ run_iperf() {
     # Start client
     # Merge server and client output
     # Store results for additional processing and also copy to stderr for progress
-    results=$(src/iperf -p $port "${server[@]}" 2>&1 | {
+    results=$(@ src/iperf -p $port "${server[@]}" 2>&1 | {
 	    awk '{print};/listening/{exit 0}';
-	    src/iperf -p $port "${client[@]}"; cat;
+	    @ src/iperf -p $port "${client[@]}"; cat;
 	} 2>&1 | tee /dev/stderr)
 
     # Check for known error messages
